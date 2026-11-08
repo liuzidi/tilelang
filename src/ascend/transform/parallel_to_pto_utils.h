@@ -416,14 +416,73 @@ PtoRegionScan ScanPtoRegion(const Stmt &region);
  * Verify admits as Select-rewritable. */
 bool IsNoOpStmt(const Stmt &stmt);
 
-/*! Collects the handle-valued `Bind` statements of a statement tree: each
- * bound data pointer is mapped to the Var it is bound from (a buffer data
- * Var), or to nullptr when the bound value is not a plain buffer data
- * reference (an external pointer or a reinterpret). The map is the may-alias
- * oracle shared by Verify (contract checks) and Legalize (store ordering):
- * resolving a data pointer through it identifies the storage it denotes. */
-void CollectHandleBindAliases(
-    const Stmt &stmt, std::map<const VarNode *, const VarNode *> *out);
+/*! Whether \p predicate is provably true under \p analyzer. The pass's scalar
+ * `Bind` values in \p bind_env are resolved first (both passes treat a
+ * `Bind`-defined scalar as a known value), and the enclosing loop ranges must
+ * already be bound into \p analyzer. Only a constant non-zero result counts:
+ * false, a runtime condition, or anything the analyzer cannot decide is NOT
+ * provably true, and the caller keeps rejecting it.
+ *
+ * Dropping a predicate is only sound when it provably holds for every lane and
+ * every iteration -- an unproven one would turn a conditional access into an
+ * unconditional one. */
+bool IsProvablyTruePredicate(const PrimExpr &predicate,
+                             arith::Analyzer *analyzer,
+                             const Map<Var, PrimExpr> &bind_env);
+
+/*! Collects the target Vars of the handle-valued `Bind` statements of a
+ * statement tree (`q = A.data`, `r = q`, a reinterpret cast, ...). A buffer
+ * declared over one of these pointers is a view whose storage the lane
+ * analysis cannot follow, so Verify rejects every access to such a view before
+ * Legalize runs.
+ *
+ * The origin of the pointer is deliberately NOT traced. Two reasons: a handle
+ * `BufferLoad` carries a pointer *value*, not the storage that holds it, so
+ * treating it as the aliased storage had no basis; and a one-hop resolution let
+ * two admission bypasses through (a volatile view over a fresh data Var, and a
+ * reinterpret cast laundered through a second Bind). Without the view there is
+ * nothing for the ordering analysis to miss. */
+void CollectHandleBindTargets(const Stmt &stmt,
+                              std::set<const VarNode *> *out);
+
+/*! What a function knows about where its buffers live. */
+struct StorageOrigins {
+  /*! Data Vars of real allocations (`AllocBuffer` / block `alloc_buffers`).
+   * Two of these are distinct storage by construction. */
+  std::set<const VarNode *> allocations;
+  /*! Data Vars of parameter buffers. */
+  std::set<const VarNode *> parameters;
+  /*! Parameter data Vars the caller declared as non-restrict; the source may
+   * pass any of them the same storage. */
+  std::set<const VarNode *> non_restrict;
+  /*! True only when the function explicitly asserts `tir.noalias`. Absent is
+   * NOT a no-alias promise: at this stage of the pipeline SplitHostDevice has
+   * not yet materialised the kernel ABI, so two parameters may still be two
+   * views of one storage (this pass runs before it). */
+  bool no_alias = false;
+};
+
+/*! Collects the origins of \p body plus the parameter ABI facts: buffer_map
+ * entries, `tir.noalias`, and `tl.non_restrict_params` (either the function
+ * attribute or a block annotation; the hoisting pass runs later). */
+StorageOrigins CollectStorageOrigins(const Stmt &body,
+                                     const Map<Var, Buffer> &buffer_map,
+                                     bool no_alias,
+                                     const Array<Var> &non_restrict_params);
+
+/*! Whether two accesses may touch the same storage.
+ *
+ * Same data Var conflicts. Two distinct allocations never do. Two distinct
+ * parameters are independent only under an explicit no-alias contract that does
+ * not list either of them as non-restrict; otherwise they may alias, which is
+ * what keeps a conditional snapshot in place when the source passes one storage
+ * twice. Anything else (an allocation against a parameter, a pointer with no
+ * origin) stays conservatively conflicting.
+ *
+ * Verify's contract checks and Legalize's ordering share this one judgment, so
+ * the two passes cannot classify a pair differently. */
+bool MayConflictStorage(const BufferNode *lhs, const BufferNode *rhs,
+                        const StorageOrigins &origins);
 
 /*!
  * \brief One relational node kind: how to take its operands, its PTODSL compare

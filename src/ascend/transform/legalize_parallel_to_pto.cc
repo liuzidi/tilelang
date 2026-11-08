@@ -25,6 +25,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -142,16 +143,101 @@ public:
       // outside it is rewritten.
       return StmtExprMutator::VisitStmt_(op);
     }
+    // Predicates are part of the admission contract, not of the rewrite: a
+    // provably-true predicate limits nothing, so it is cleared here for the
+    // whole converting region -- the unit and its region-level siblings -- before
+    // any control flow is folded. Folding builds new stores without the field, so
+    // clearing must happen first; doing it afterwards would silently drop an
+    // unproven predicate and turn a conditional access into an unconditional one.
+    // A hand-written VMI region (SIMD_VF without a Parallel unit) is out of
+    // this pass's contract; only a region that carries a unit is normalized.
+    Stmt normalized =
+        HasParallelUnit(op->body) ? NormalizePredicates(op->body) : op->body;
     // No region-level gate: every rewrite below is gated on `in_parallel_`, so
     // a hand-written VMI region (SIMD_VF without a unit) stays untouched.
     bool saved = in_simd_vf_;
     in_simd_vf_ = true;
-    Stmt body = StmtExprMutator::VisitStmt(op->body);
+    Stmt body = StmtExprMutator::VisitStmt(normalized);
     in_simd_vf_ = saved;
     SBlock block = GetRef<SBlock>(op);
     SBlockNode *node = block.CopyOnWrite();
     node->body = body;
     return block;
+  }
+
+  static bool HasParallelUnit(const Stmt &body) {
+    bool found = false;
+    PostOrderVisit(body, [&found](const ObjectRef &node) {
+      if (const auto *loop = node.as<ForNode>()) {
+        if (loop->kind == ForKind::kParallel) {
+          found = true;
+        }
+      }
+    });
+    return found;
+  }
+
+  // Clears an access predicate that provably holds. Verify admitted the field
+  // only when it is provably true, so anything else here means the two passes
+  // disagree; that is reported instead of ignored, because dropping a
+  // conditional access makes it unconditional. The judgment is the same helper
+  // Verify uses, with the same loop-range and scalar-Bind context.
+  Stmt NormalizePredicates(const Stmt &body) {
+    class Normalizer : public StmtExprMutator {
+     public:
+      explicit Normalizer(ControlFlowMutator *parent) : parent_(parent) {}
+
+      Stmt VisitStmt_(const ForNode *op) final {
+        parent_->predicate_analyzer_.Bind(
+            op->loop_var, Range::FromMinExtent(op->min, op->extent),
+            /*allow_override=*/true);
+        return StmtExprMutator::VisitStmt_(op);
+      }
+      Stmt VisitStmt_(const BindNode *op) final {
+        Stmt result = StmtExprMutator::VisitStmt_(op);
+        if (const auto *bind = result.as<BindNode>()) {
+          if (!bind->value.dtype().is_handle()) {
+            parent_->predicate_env_.Set(bind->var, bind->value);
+          }
+        }
+        return result;
+      }
+      Stmt VisitStmt_(const BufferStoreNode *op) final {
+        BufferStore store =
+            Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
+        if (store->predicate.defined()) {
+          parent_->CheckAdmittedPredicate(store->predicate.value(),
+                                          store->buffer->name);
+          store.CopyOnWrite()->predicate = std::nullopt;
+        }
+        return store;
+      }
+      PrimExpr VisitExpr_(const BufferLoadNode *op) final {
+        BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
+        if (load->predicate.defined()) {
+          parent_->CheckAdmittedPredicate(load->predicate.value(),
+                                          load->buffer->name);
+          load.CopyOnWrite()->predicate = std::nullopt;
+        }
+        return load;
+      }
+
+     private:
+      ControlFlowMutator *parent_;
+    };
+    Normalizer normalizer(this);
+    return normalizer(body);
+  }
+
+  void CheckAdmittedPredicate(const PrimExpr &predicate,
+                              const String &buffer_name) {
+    if (!pto::IsProvablyTruePredicate(predicate, &predicate_analyzer_,
+                                      predicate_env_)) {
+      Fail("buffer `" + std::string(buffer_name) +
+           "` carries an access predicate that is not provably true; "
+           "VerifyParallelToPTO admits only compile-time-true predicates, so "
+           "the two passes disagree");
+    }
   }
 
   Stmt VisitStmt_(const ForNode *op) final {
@@ -258,38 +344,14 @@ public:
     }
     return StmtExprMutator::VisitExpr_(op);
   }
-  // Conservative alias test for *ordering*: two accesses may conflict unless
-  // they live in different allocations. Views over the same storage are
-  // treated as conflicting even when their logical indices differ, because
-  // A[1,i] and Av[0,i] can denote the same physical address.
-  // Handle-valued Binds of the whole function (see CollectHandleBindAliases).
-  std::map<const VarNode *, const VarNode *> alias_src_;
-  // Resolves a data pointer through the function's handle Binds to the
-  // buffer data Var it ultimately denotes; nullptr when the pointer has no
-  // resolvable buffer source (external pointer / reinterpret). Ordering and
-  // conflict checks must compare resolved storage, or two views of one
-  // allocation would look unrelated and their ordering constraints would be
-  // missed (an alias WAW could be reordered into a different final value).
-  const VarNode *ResolveDataVar(const VarNode *v) const {
-    for (int depth = 0; depth < 8; ++depth) {
-      auto it = alias_src_.find(v);
-      if (it == alias_src_.end()) {
-        return v;
-      }
-      if (it->second == nullptr) {
-        return nullptr;
-      }
-      v = it->second;
-    }
-    return nullptr;  // chain too deep: conservatively unresolved
-  }
+  // Conservative storage test for *ordering*: two accesses may conflict unless
+  // they name different known origins (a parameter or an allocation). Views over
+  // the same storage conflict even when their logical indices differ, because
+  // A[1,i] and Av[0,i] can denote the same physical address. The judgment is the
+  // same one Verify applies (pto::MayConflictStorage), so the two passes cannot
+  // classify a pair differently.
   bool MayConflict(const BufferNode *lhs_buffer, const BufferNode *rhs_buffer) {
-    const VarNode *lhs = ResolveDataVar(lhs_buffer->data.get());
-    const VarNode *rhs = ResolveDataVar(rhs_buffer->data.get());
-    if (lhs == nullptr || rhs == nullptr) {
-      return true;  // an unresolvable pointer is conservatively conflicting
-    }
-    return lhs == rhs;
+    return pto::MayConflictStorage(lhs_buffer, rhs_buffer, storage_origins_);
   }
 
   bool SameArmLocation(const BufferNode *lhs_buffer,
@@ -718,14 +780,34 @@ public:
   bool in_parallel_ = false;
   Var parallel_var_;
   int condition_serial_ = 0;
+  // Storage origins: which data Vars are real allocations and which are
+  // parameters, plus the parameter no-alias facts.
+  pto::StorageOrigins storage_origins_;
+  // Predicate context for the whole-region normalisation: the loop ranges the
+  // region imposes and the scalar `Bind` values in scope, exactly the context
+  // Verify used to admit the predicate.
+  arith::Analyzer predicate_analyzer_;
+  Map<Var, PrimExpr> predicate_env_;
 };
 
 PrimFunc LowerControlFlow(PrimFunc f) {
   auto *n = f.CopyOnWrite();
   ControlFlowMutator mutator;
-  // Alias resolution is collected before the fold so the ordering analysis
-  // sees the storage each view denotes.
-  pto::CollectHandleBindAliases(n->body, &mutator.alias_src_);
+  // Storage origins are collected before the fold so the ordering analysis can
+  // tell two independent allocations apart from two views of one storage. The
+  // parameter side needs the ABI's alias contract: at this stage
+  // SplitHostDevice has not run, so a missing `tir.noalias` means two
+  // parameters may still be one storage (see MayConflictStorage).
+  const bool no_alias = [&] {
+    auto attr = n->GetAttr<Integer>(tirx::attr::kNoAlias);
+    return attr.defined() && attr.value()->value != 0;
+  }();
+  Array<Var> non_restrict;
+  if (auto attr = n->GetAttr<Array<Var>>(tl::attr::kNonRestrictParams)) {
+    non_restrict = attr.value();
+  }
+  mutator.storage_origins_ = pto::CollectStorageOrigins(
+      n->body, n->buffer_map, no_alias, non_restrict);
   n->body = mutator(std::move(n->body));
   return f;
 }

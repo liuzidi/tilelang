@@ -1620,3 +1620,879 @@ def test_multi_writes_with_unchanged_condition_input_add_no_snapshot():
     assert not _condition_snapshots(stages["legalize"]), (
         "two Selects over an unchanged input may share the original expression"
     )
+
+
+# ---------------------------------------------------------------------------
+# Uniform boolean combinations: the scalar domain Verify admitted survives
+# ---------------------------------------------------------------------------
+
+_BOOL_COMBINE = {
+    "and": lambda p, q: (p > 0) & (q > 0),
+    "or": lambda p, q: (p > 0) | (q > 0),
+    "eq": lambda p, q: (p > 0) == (q > 0),
+    "not": lambda p, q: ~(p > 0),
+}
+
+
+def _k_uniform_bool_select(op, E=256, lanes=64):
+    """A fully lane-uniform boolean condition selecting two int8 scalars."""
+
+    combine = _BOOL_COMBINE[op]
+
+    @T.prim_func
+    def main(
+        P: T.int32,
+        Q: T.int32,
+        M: T.int8,
+        N: T.int8,
+        A: T.Tensor((E,), "int8"),
+        Y: T.Tensor((E,), "int8"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "int8")
+            y = T.alloc_shared((E,), "int8")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    c = tvm.tirx.Select(combine(P, Q), M, N)
+                    y[i] = a[i] + c * c
+            T.copy(y, Y)
+
+    return main
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("op", ["and", "or", "eq", "not"])
+def test_uniform_boolean_combination_stays_scalar_in_the_unit(op):
+    """`(P>0) <op> (Q>0)` over runtime scalars must not build a lane mask.
+
+    Forcing the mask promotes the selected int8 scalars into a vreg, and
+    `c * c` then becomes an int8 `vmul` the VMI element set does not carry.
+    """
+    stages, error = _lower_capture(_k_uniform_bool_select(op))
+    assert error is None, f"a fully lane-uniform `{op}` must lower, got: {error}"
+
+    names = _vmi_call_names(stages["vectorize"])
+    assert names.get("tl.vmi.vsel", 0) == 0, f"scalar Select must not become vsel: {names}"
+    assert names.get("tl.vmi.vcmp", 0) == 0 and names.get("tl.vmi.vcmps", 0) == 0, (
+        f"the uniform condition must stay a scalar compare: {names}"
+    )
+    for mask_op in ("tl.vmi.vand", "tl.vmi.vor", "tl.vmi.vnot"):
+        assert names.get(mask_op, 0) == 0, (
+            f"a fully lane-uniform combination must not lift to {mask_op}: {names}"
+        )
+    assert names.get("tl.vmi.vmul", 0) == 0, (
+        f"the int8 scalar multiply must not become a vmul: {names}"
+    )
+    assert _selects(stages["vectorize"]), "the scalar Select must survive"
+
+
+def _k_varying_bool_select(E=256, lanes=64):
+    @T.prim_func
+    def main(A: T.Tensor((E,), "float32"), Y: T.Tensor((E,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            y = T.alloc_shared((E,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    y[i] = tvm.tirx.Select(
+                        (a[i] > T.float32(0.0)) & (a[i] < T.float32(8.0)),
+                        T.float32(1.0),
+                        T.float32(0.0),
+                    )
+            T.copy(y, Y)
+
+    return main
+
+
+@pytest.mark.pto
+def test_lane_varying_boolean_combination_still_uses_a_mask():
+    """The counterpart: a lane-varying `&` keeps the mask lowering."""
+    stages, error = _lower_capture(_k_varying_bool_select())
+    assert error is None, f"a lane-varying `&` must lower, got: {error}"
+
+    names = _vmi_call_names(stages["vectorize"])
+    assert names.get("tl.vmi.vand", 0) >= 1, f"the varying combine must use vand: {names}"
+    assert names.get("tl.vmi.vsel", 0) >= 1, f"the varying Select must use vsel: {names}"
+
+
+# ---------------------------------------------------------------------------
+# Access predicates: absent or provably true only
+# ---------------------------------------------------------------------------
+
+
+def _k_plain_two_stores(E=256, lanes=64):
+    @T.prim_func
+    def main(
+        P: T.int32,
+        A: T.Tensor((E,), "float32"),
+        Y: T.Tensor((E,), "float32"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            y = T.alloc_shared((E,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    a[i] = a[i] + T.float32(1.0)
+                    y[i] = a[i] * T.float32(2.0)
+            T.copy(y, Y)
+
+    return main
+
+
+def _with_store_predicate(func, factory):
+    """Attach `factory(func)` as the predicate of every BufferStore."""
+
+    def post(node):
+        if isinstance(node, tvm.tirx.BufferStore):
+            return tvm.tirx.BufferStore(
+                node.buffer, node.value, node.indices, factory(func)
+            )
+        return None
+
+    body = tvm.tirx.stmt_functor.ir_transform(
+        func.body, None, post, ["tirx.BufferStore"]
+    )
+    return func.with_body(body)
+
+
+@pytest.mark.pto
+def test_provably_true_store_predicate_is_admitted_and_cleared():
+    """A literal-true predicate limits nothing: Verify admits it, Legalize clears it."""
+    stages, error = _lower_capture(
+        _with_store_predicate(_k_plain_two_stores(), lambda f: tvm.tirx.const(True, "bool"))
+    )
+    assert error is None, f"a provably-true predicate must be admitted, got: {error}"
+
+    legalized = stages["legalize"]
+    predicated = [
+        node
+        for node in _collect(legalized, lambda n: isinstance(n, tvm.tirx.BufferStore))
+        if node.predicate is not None
+    ]
+    assert not predicated, "Legalize must clear an admitted predicate before folding"
+
+
+@pytest.mark.pto
+def test_loop_range_true_store_predicate_is_admitted_and_cleared():
+    """`i < E` is provable from the unit's own range, not from a guess."""
+    state = {}
+
+    def pre(node):
+        if (
+            isinstance(node, tvm.tirx.For)
+            and node.kind == tvm.tirx.ForKind.PARALLEL
+            and "loop_var" not in state
+        ):
+            state["loop_var"] = node.loop_var
+        return None
+
+    func = _k_plain_two_stores()
+
+    def factory(f):
+        return tvm.tirx.LT(state["loop_var"], tvm.tirx.IntImm("int32", 256))
+
+    def post(node):
+        if isinstance(node, tvm.tirx.BufferStore):
+            return tvm.tirx.BufferStore(
+                node.buffer, node.value, node.indices, factory(func)
+            )
+        return None
+
+    body = tvm.tirx.stmt_functor.ir_transform(
+        func.body, pre, post, ["tirx.For", "tirx.BufferStore"]
+    )
+    stages, error = _lower_capture(func.with_body(body))
+    assert error is None, f"a range-provable predicate must be admitted, got: {error}"
+    predicated = [
+        node
+        for node in _collect(stages["legalize"], lambda n: isinstance(n, tvm.tirx.BufferStore))
+        if node.predicate is not None
+    ]
+    assert not predicated, "Legalize must clear a range-provable predicate"
+
+
+@pytest.mark.pto
+def test_false_store_predicate_is_rejected():
+    _, error = _lower_capture(
+        _with_store_predicate(_k_plain_two_stores(), lambda f: tvm.tirx.const(False, "bool")),
+        expect_error=True,
+    )
+    assert error is not None, "a false predicate must be rejected"
+    assert "not provably true" in str(error), f"unexpected diagnostic: {error}"
+
+
+@pytest.mark.pto
+def test_runtime_store_predicate_is_rejected():
+    _, error = _lower_capture(
+        _with_store_predicate(
+            _k_plain_two_stores(), lambda f: f.params[0] > tvm.tirx.IntImm("int32", 0)
+        ),
+        expect_error=True,
+    )
+    assert error is not None, "a runtime predicate must be rejected"
+    assert "not provably true" in str(error), f"unexpected diagnostic: {error}"
+
+
+@pytest.mark.pto
+def test_predicate_with_an_undefined_variable_is_rejected():
+    """The reference check must run on the original expression.
+
+    Simplifying first would fold `True | ghost` to True and hide the undefined
+    variable.
+    """
+    ghost = tvm.tirx.Var("ghost_flag", "bool")
+
+    def factory(f):
+        return tvm.tirx.Or(tvm.tirx.const(True, "bool"), ghost)
+
+    _, error = _lower_capture(
+        _with_store_predicate(_k_plain_two_stores(), factory), expect_error=True
+    )
+    assert error is not None, "an undefined variable in a predicate must be rejected"
+    # AdmitPredicates now owns the reference check, so the diagnostic names the
+    # region scope rather than the unit's own "never defined" wording.
+    assert "not defined in the lexical scope" in str(error), (
+        f"unexpected diagnostic: {error}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Handle-Bind views: rejected, not resolved
+# ---------------------------------------------------------------------------
+
+
+def _view_over_bound_pointer(func, tag="alias"):
+    """Rewrite one unit store to write through a view of a Bind-produced pointer.
+
+    Emits the shape `q = A.data; DeclBuffer(view, data=q)` the alias admission
+    used to accept. The Bind is spliced into the enclosing SeqStmt so it
+    dominates the rewritten store.
+    """
+    state = {}
+
+    def post(node):
+        if isinstance(node, tvm.tirx.BufferStore) and "view" not in state:
+            src = node.buffer
+            pointer = tvm.tirx.Var(
+                tag + "_ptr",
+                tvm.ir.PointerType(tvm.ir.PrimType(src.dtype), src.scope()),
+            )
+            view = tvm.tirx.decl_buffer(
+                src.shape, src.dtype, data=pointer, scope=src.scope()
+            )
+            state["view"] = view
+            state["bind"] = tvm.tirx.Bind(pointer, src.data)
+            return tvm.tirx.BufferStore(view, node.value, node.indices)
+        if isinstance(node, tvm.tirx.SeqStmt) and "bind" in state and "spliced" not in state:
+            state["spliced"] = True
+            return tvm.tirx.SeqStmt([state["bind"]] + list(node.seq))
+        return None
+
+    body = tvm.tirx.stmt_functor.ir_transform(
+        func.body, None, post, ["tirx.BufferStore", "tirx.SeqStmt"]
+    )
+    return func.with_body(body)
+
+
+@pytest.mark.pto
+def test_buffer_view_over_a_bound_data_pointer_is_rejected():
+    """A view the lane analysis cannot follow is refused at Verify.
+
+    Ordering cannot repair an access that should never be admitted: the pointer
+    may be external, a reinterpret cast, or a laundered copy, so its storage is
+    unknown rather than aliased.
+    """
+    _, error = _lower_capture(_view_over_bound_pointer(_k_plain_two_stores()), expect_error=True)
+    assert error is not None, "a view over a Bind-produced pointer must be rejected"
+    assert "bound by a handle Bind" in str(error), f"unexpected diagnostic: {error}"
+
+
+def _k_uniform_bool_nodes(op, E=256, lanes=64):
+    """The node spellings (`And`/`Or`/`Not`) rather than the `bitwise_*` calls."""
+
+    combine = {
+        "and": lambda p, q: tvm.tirx.And(p > 0, q > 0),
+        "or": lambda p, q: tvm.tirx.Or(p > 0, q > 0),
+        "not": lambda p, q: tvm.tirx.Not(p > 0),
+        "ne": lambda p, q: tvm.tirx.NE(p > 0, q > 0),
+    }[op]
+
+    @T.prim_func
+    def main(
+        P: T.int32,
+        Q: T.int32,
+        M: T.int8,
+        N: T.int8,
+        A: T.Tensor((E,), "int8"),
+        Y: T.Tensor((E,), "int8"),
+    ):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "int8")
+            y = T.alloc_shared((E,), "int8")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    c = tvm.tirx.Select(combine(P, Q), M, N)
+                    y[i] = a[i] + c * c
+            T.copy(y, Y)
+
+    return main
+
+
+@pytest.mark.pto
+@pytest.mark.parametrize("op", ["and", "or", "not", "ne"])
+def test_uniform_bool_node_spellings_stay_scalar(op):
+    """`And`/`Or`/`Not`/`NE` nodes take the same scalar path as `bitwise_*`."""
+    stages, error = _lower_capture(_k_uniform_bool_nodes(op))
+    assert error is None, f"a fully lane-uniform `{op}` node must lower, got: {error}"
+
+    names = _vmi_call_names(stages["vectorize"])
+    assert names.get("tl.vmi.vsel", 0) == 0, f"scalar Select must not become vsel: {names}"
+    for mask_op in ("tl.vmi.vand", "tl.vmi.vor", "tl.vmi.vnot", "tl.vmi.vcmp"):
+        assert names.get(mask_op, 0) == 0, f"`{op}` must not lift to {mask_op}: {names}"
+    assert names.get("tl.vmi.vmul", 0) == 0, f"int8 multiply must not become vmul: {names}"
+
+
+def _k_mask_with_scalar_eq(E=256, lanes=64):
+    """A bool EQ/NE between a lane mask and a scalar bool keeps the truth table."""
+
+    @T.prim_func
+    def main(A: T.Tensor((E,), "float32"), Y: T.Tensor((E,), "float32"), FLAG: T.bool):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            y = T.alloc_shared((E,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    y[i] = tvm.tirx.Select(
+                        tvm.tirx.EQ(a[i] > T.float32(0.0), FLAG),
+                        T.float32(1.0),
+                        T.float32(0.0),
+                    )
+            T.copy(y, Y)
+
+    return main
+
+
+@pytest.mark.pto
+def test_mask_with_scalar_bool_equality_uses_the_truth_table():
+    """A mask-vs-scalar EQ cannot be a vcmp: the VMI element set has no bool."""
+    stages, error = _lower_capture(_k_mask_with_scalar_eq())
+    assert error is None, f"a mask/scalar EQ must lower, got: {error}"
+
+    names = _vmi_call_names(stages["vectorize"])
+    assert names.get("tl.vmi.vand", 0) >= 1, f"the truth table needs vand: {names}"
+    assert names.get("tl.vmi.vsel", 0) >= 1, f"the Select must use vsel: {names}"
+
+
+def _k_serial_outside_unit(E=256, lanes=64, iters=8):
+    @T.prim_func
+    def main(A: T.Tensor((E,), "float32"), Y: T.Tensor((E,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            y = T.alloc_shared((E,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for j in T.serial(iters):
+                    for i in T.Parallel(E):
+                        y[i] = a[i] + T.float32(1.0)
+            T.copy(y, Y)
+
+    return main
+
+
+@pytest.mark.pto
+def test_outer_serial_range_makes_a_unit_predicate_provable():
+    """`j < iters` rests on the enclosing serial range, not on the unit.
+
+    Verify and Legalize must carry the same lexical facts, or a predicate the
+    normaliser would clear is rejected before it ever gets there.
+    """
+    state = {}
+
+    def pre(node):
+        if (
+            isinstance(node, tvm.tirx.For)
+            and node.kind == tvm.tirx.ForKind.SERIAL
+            and "serial_var" not in state
+        ):
+            state["serial_var"] = node.loop_var
+        return None
+
+    def post(node):
+        if isinstance(node, tvm.tirx.BufferStore) and "serial_var" in state:
+            return tvm.tirx.BufferStore(
+                node.buffer,
+                node.value,
+                node.indices,
+                state["serial_var"] < tvm.tirx.IntImm("int32", 8),
+            )
+        return None
+
+    func = _k_serial_outside_unit()
+    body = tvm.tirx.stmt_functor.ir_transform(
+        func.body, pre, post, ["tirx.For", "tirx.BufferStore"]
+    )
+    stages, error = _lower_capture(func.with_body(body))
+    assert error is None, f"an outer-range predicate must be admitted, got: {error}"
+    predicated = [
+        node
+        for node in _collect(stages["legalize"], lambda n: isinstance(n, tvm.tirx.BufferStore))
+        if node.predicate is not None
+    ]
+    assert not predicated, "Legalize must clear the outer-range predicate"
+
+
+def _append_region_level_access(func, kind, make_predicate):
+    """Append one region-level access (a load or a store) inside SIMD_VF.
+
+    A region-level access sits beside the Parallel unit, so its predicate goes
+    through the same admission as a unit access -- but not through the unit
+    visitor, which is why it used to escape the reference check.
+    """
+    state = {}
+
+    def post(node):
+        if (
+            isinstance(node, tvm.tirx.BufferStore)
+            and node.buffer.scope() in ("shared", "shared.dyn")
+        ):
+            state.setdefault("store_buffer", node.buffer)
+        if (
+            isinstance(node, tvm.tirx.BufferLoad)
+            and node.buffer.scope() in ("shared", "shared.dyn")
+        ):
+            state.setdefault("load_buffer", node.buffer)
+        if isinstance(node, tvm.tirx.SBlock) and node.name_hint == "SIMD_VF":
+            load_buf = state["load_buffer"]
+            store_buf = state["store_buffer"]
+            predicate = make_predicate()
+            if kind == "load":
+                stmt = tvm.tirx.Evaluate(
+                    tvm.tirx.BufferLoad(
+                        load_buf, [tvm.tirx.IntImm("int32", 0)], predicate=predicate
+                    )
+                )
+            else:
+                value = tvm.tirx.BufferLoad(load_buf, [tvm.tirx.IntImm("int32", 0)])
+                stmt = tvm.tirx.BufferStore(
+                    store_buf,
+                    value,
+                    [tvm.tirx.IntImm("int32", 0)],
+                    predicate=predicate,
+                )
+            body = node.body
+            new_body = (
+                tvm.tirx.SeqStmt(list(body.seq) + [stmt])
+                if isinstance(body, tvm.tirx.SeqStmt)
+                else tvm.tirx.SeqStmt([body, stmt])
+            )
+            return tvm.tirx.SBlock(
+                node.iter_vars,
+                node.reads,
+                node.writes,
+                node.name_hint,
+                new_body,
+                init=node.init,
+                alloc_buffers=node.alloc_buffers,
+                match_buffers=node.match_buffers,
+                annotations=node.annotations,
+            )
+        return None
+
+    body = tvm.tirx.stmt_functor.ir_transform(
+        func.body, None, post, ["tirx.BufferStore", "tirx.BufferLoad", "tirx.SBlock"]
+    )
+    return func.with_body(body)
+
+
+@pytest.mark.pto
+def test_region_level_load_predicate_with_undefined_variable_is_rejected():
+    """The predicate reference check must run before the truth proof.
+
+    `True | ghost` folds to True, so a proof-first order (or a walk that only
+    covers stores) accepts the load and Legalize then deletes the field together
+    with the undefined variable.
+    """
+    ghost = tvm.tirx.Var("ghost_flag", "bool")
+    func = _append_region_level_access(
+        _k_plain_two_stores(),
+        "load",
+        lambda: tvm.tirx.Or(tvm.tirx.const(True, "bool"), ghost),
+    )
+    _, error = _lower_capture(func, expect_error=True)
+    assert error is not None, "an undefined variable in a load predicate must be rejected"
+    assert "not defined in the lexical scope" in str(error), f"unexpected diagnostic: {error}"
+
+
+@pytest.mark.pto
+def test_region_level_false_load_predicate_is_rejected():
+    func = _append_region_level_access(
+        _k_plain_two_stores(), "load", lambda: tvm.tirx.const(False, "bool")
+    )
+    _, error = _lower_capture(func, expect_error=True)
+    assert error is not None, "a false load predicate must be rejected"
+    assert "not provably true" in str(error), f"unexpected diagnostic: {error}"
+
+
+@pytest.mark.pto
+def test_region_level_true_load_predicate_is_admitted_and_cleared():
+    func = _append_region_level_access(
+        _k_plain_two_stores(), "load", lambda: tvm.tirx.const(True, "bool")
+    )
+    stages, error = _lower_capture(func)
+    assert error is None, f"a provably-true load predicate must be admitted, got: {error}"
+    predicated = [
+        node
+        for node in _collect(
+            stages["legalize"], lambda n: isinstance(n, tvm.tirx.BufferLoad)
+        )
+        if node.predicate is not None
+    ]
+    assert not predicated, "Legalize must clear the admitted load predicate"
+
+
+def _k_region_level_bind(E=256, lanes=64):
+    @T.prim_func
+    def main(A: T.Tensor((E,), "float32"), Y: T.Tensor((E,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            y = T.alloc_shared((E,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                flag = T.float32(1.0) > T.float32(0.0)
+                for i in T.Parallel(E):
+                    y[i] = a[i] + T.float32(1.0)
+                y[0] = a[0] + T.float32(2.0)
+            T.copy(y, Y)
+
+    return main
+
+
+@pytest.mark.pto
+def test_region_level_bind_makes_a_predicate_provable():
+    """A region-level scalar Bind is a fact for the predicate walk."""
+    state = {}
+
+    def post(node):
+        if isinstance(node, tvm.tirx.Bind) and node.value.dtype == tvm.DataType("bool"):
+            state.setdefault("flag", node.var)
+        if (
+            isinstance(node, tvm.tirx.BufferStore)
+            and node.buffer.scope() in ("shared", "shared.dyn")
+            and "flag" in state
+            and node.indices
+        ):
+            return None
+        return None
+
+    def post_store(node):
+        if (
+            isinstance(node, tvm.tirx.BufferStore)
+            and node.buffer.scope() in ("shared", "shared.dyn")
+            and "flag" in state
+            and isinstance(node.indices[0], tvm.tirx.IntImm)
+        ):
+            return tvm.tirx.BufferStore(
+                node.buffer, node.value, node.indices, predicate=state["flag"]
+            )
+        return None
+
+    func = _k_region_level_bind()
+    body = tvm.tirx.stmt_functor.ir_transform(
+        func.body, None, post, ["tirx.Bind"]
+    )
+    func = func.with_body(body)
+    body = tvm.tirx.stmt_functor.ir_transform(
+        func.body, None, post_store, ["tirx.BufferStore"]
+    )
+    stages, error = _lower_capture(func.with_body(body))
+    assert error is None, f"a Bind-backed predicate must be admitted, got: {error}"
+    predicated = [
+        node
+        for node in _collect(
+            stages["legalize"], lambda n: isinstance(n, tvm.tirx.BufferStore)
+        )
+        if node.predicate is not None
+    ]
+    assert not predicated, "Legalize must clear a Bind-backed predicate"
+
+
+# ---------------------------------------------------------------------------
+# Parameter alias contract: two parameters are independent only under an
+# explicit no-alias promise, and a non-restrict parameter cancels it.
+# ---------------------------------------------------------------------------
+
+
+def _k_two_shared_params(E=256, lanes=64):
+    """Condition reads one UB buffer, two stores write another."""
+
+    @T.prim_func
+    def main(A: T.Tensor((E,), "float32"), Y: T.Tensor((E,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            y = T.alloc_shared((E,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for i in T.Parallel(E):
+                    if a[i] > T.float32(0.0):
+                        y[i] = T.float32(0.0)
+                        y[i] = T.float32(1.0)
+            T.copy(y, Y)
+
+    return main
+
+
+def _as_shared_params(func, names=("a", "y"), extent=256):
+    """Turn two UB allocations into shared-scope parameters.
+
+    The frontend cannot declare a shared-scope parameter, so the two buffers a
+    conditional reads and writes are hoisted into the ABI: now the caller may
+    pass the same storage twice, and the pass must not assume independence.
+    """
+    f32 = tvm.DataType("float32")
+    old = {}
+    new = {}
+    handles = {}
+
+    def collect(node):
+        if isinstance(node, tvm.tirx.SBlock):
+            for buffer in node.alloc_buffers:
+                if buffer.name in names:
+                    old[buffer.name] = buffer
+
+    tvm.tirx.stmt_functor.post_order_visit(func.body, collect)
+    for name in names:
+        if name not in old:
+            raise AssertionError(f"buffer `{name}` not found among the allocations")
+        var = tvm.tirx.Var(
+            name + "_param",
+            tvm.ir.PointerType(tvm.ir.PrimType(f32), "shared.dyn"),
+        )
+        handles[name] = var
+        # A shared-scope parameter has no allocation base to infer from, so the
+        # ABI must state the alignment the masked vstore needs.
+        new[name] = tvm.tirx.decl_buffer(
+            (extent,), "float32", data=var, scope="shared.dyn", data_alignment=64
+        )
+
+    def post(node):
+        if isinstance(node, tvm.tirx.SBlock):
+            kept = [b for b in node.alloc_buffers if b.name not in names]
+            return tvm.tirx.SBlock(
+                node.iter_vars,
+                node.reads,
+                node.writes,
+                node.name_hint,
+                node.body,
+                init=node.init,
+                alloc_buffers=kept,
+                match_buffers=node.match_buffers,
+                annotations=node.annotations,
+            )
+        if isinstance(node, tvm.tirx.BufferStore) and node.buffer.name in names:
+            return tvm.tirx.BufferStore(
+                new[node.buffer.name], node.value, node.indices, node.predicate
+            )
+        if isinstance(node, tvm.tirx.BufferLoad) and node.buffer.name in names:
+            return tvm.tirx.BufferLoad(
+                new[node.buffer.name], node.indices, node.predicate
+            )
+        return None
+
+    body = tvm.tirx.stmt_functor.ir_transform(
+        func.body,
+        None,
+        post,
+        ["tirx.SBlock", "tirx.BufferStore", "tirx.BufferLoad"],
+    )
+    buffer_map = {k: v for k, v in func.buffer_map.items()}
+    params = list(func.params)
+    for name in names:
+        params.append(handles[name])
+        buffer_map[handles[name]] = new[name]
+    return tvm.tirx.PrimFunc(params, body, func.ret_type, buffer_map, func.attrs)
+
+
+def _assert_noalias(func):
+    return func.with_attr("tirx.noalias", tvm.tirx.IntImm("int32", 1))
+
+
+def _assert_non_restrict(func, name="a_param"):
+    var = next(v for v in func.params if v.name == name)
+    return func.with_attr("tl.non_restrict_params", [var])
+
+
+def _snapshot_count(func):
+    """Count entry snapshots in the Legalize output of a shared-parameter kernel.
+
+    A shared-scope parameter has no UB allocation root, so the later codegen
+    legality pass cannot prove its masked-store alignment and the full pipeline
+    stops there. The alias contract itself is decided by Legalize -- its conflict
+    test drives the snapshot -- and that stage is captured before the failure, so
+    the capture is read with `expect_error=True` and only the Legalize module is
+    inspected.
+    """
+    stages, error = _lower_capture(func, expect_error=True)
+    legalized = stages.get("legalize")
+    assert legalized is not None, f"Legalize did not run: {error}"
+    return len(_condition_snapshots(legalized))
+
+
+@pytest.mark.pto
+def test_distinct_params_without_a_noalias_promise_keep_the_snapshot():
+    """No `tirx.noalias` at this stage: the caller may pass one storage twice."""
+    assert _snapshot_count(_as_shared_params(_k_two_shared_params())) == 1
+
+
+@pytest.mark.pto
+def test_distinct_params_under_a_noalias_promise_skip_the_snapshot():
+    """An explicit no-alias promise makes two parameters independent."""
+    func = _assert_noalias(_as_shared_params(_k_two_shared_params()))
+    assert _snapshot_count(func) == 0
+
+
+@pytest.mark.pto
+def test_non_restrict_param_cancels_the_noalias_promise():
+    """`tl.non_restrict_params` says the pointer may alias after all."""
+    func = _assert_non_restrict(
+        _assert_noalias(_as_shared_params(_k_two_shared_params()))
+    )
+    assert _snapshot_count(func) == 1
+
+
+def _k_region_store_in_serial(E=256, lanes=64, iters=8):
+    """A store beside the unit, inside the enclosing serial loop."""
+
+    @T.prim_func
+    def main(A: T.Tensor((E,), "float32"), Y: T.Tensor((E,), "float32")):
+        with T.Kernel(1):
+            a = T.alloc_shared((E,), "float32")
+            y = T.alloc_shared((E,), "float32")
+            T.copy(A, a)
+            with T.SimdVF(lanes=lanes):
+                for j in T.serial(iters):
+                    for i in T.Parallel(E):
+                        y[i] = a[i] + T.float32(1.0)
+                    a[0] = a[0] + T.float32(2.0)
+            T.copy(y, Y)
+
+    return main
+
+
+def _with_region_store_predicate(func, make_predicate):
+    """Attach `make_predicate(j)` to the region-level store in the serial body."""
+
+    state = {}
+
+    def pre(node):
+        if (
+            isinstance(node, tvm.tirx.For)
+            and node.kind == tvm.tirx.ForKind.SERIAL
+            and "serial_var" not in state
+        ):
+            state["serial_var"] = node.loop_var
+        return None
+
+    def post(node):
+        if (
+            isinstance(node, tvm.tirx.BufferStore)
+            and node.buffer.scope() in ("shared", "shared.dyn")
+            and "serial_var" in state
+            and len(node.indices) == 1
+            and isinstance(node.indices[0], tvm.tirx.IntImm)
+        ):
+            return tvm.tirx.BufferStore(
+                node.buffer,
+                node.value,
+                node.indices,
+                predicate=make_predicate(state["serial_var"]),
+            )
+        return None
+
+    body = tvm.tirx.stmt_functor.ir_transform(
+        func.body, pre, post, ["tirx.For", "tirx.BufferStore"]
+    )
+    return func.with_body(body)
+
+
+@pytest.mark.pto
+def test_region_level_store_predicate_over_a_serial_range_is_admitted():
+    """`j < 8` on a store beside the unit, provable from the enclosing shell."""
+    func = _with_region_store_predicate(
+        _k_region_store_in_serial(),
+        lambda j: j < tvm.tirx.IntImm("int32", 8),
+    )
+    stages, error = _lower_capture(func)
+    assert error is None, f"a range-provable store predicate must be admitted, got: {error}"
+    predicated = [
+        node
+        for node in _collect(
+            stages["legalize"], lambda n: isinstance(n, tvm.tirx.BufferStore)
+        )
+        if node.predicate is not None
+    ]
+    assert not predicated, "Legalize must clear the admitted store predicate"
+
+
+@pytest.mark.pto
+def test_region_level_store_predicate_with_undefined_variable_is_rejected():
+    """The store path and the load path share one reference check."""
+    func = _with_region_store_predicate(
+        _k_region_store_in_serial(),
+        lambda j: tvm.tirx.Or(
+            j < tvm.tirx.IntImm("int32", 8),
+            tvm.tirx.Var("ghost_flag", "bool"),
+        ),
+    )
+    _, error = _lower_capture(func, expect_error=True)
+    assert error is not None, "an undefined variable in a store predicate must be rejected"
+    assert "not defined in the lexical scope" in str(error), f"unexpected diagnostic: {error}"
+
+
+@pytest.mark.pto
+def test_predicate_with_an_unadmitted_node_is_rejected():
+    """A predicate is an expression position: `True | ...` must not launder it.
+
+    The oracle folds `True | (P % 2 == 0)` to True, so a truth-check-only
+    admission would drop the whole predicate -- and with it an expression the
+    vectorizer has no lowering for.
+    """
+    func = _k_plain_two_stores()
+    param = func.params[0]
+    func = _append_region_level_access(
+        func,
+        "load",
+        lambda: tvm.tirx.Or(
+            tvm.tirx.const(True, "bool"),
+            tvm.tirx.EQ(
+                tvm.tirx.floormod(param, 2), tvm.tirx.IntImm("int32", 0)
+            ),
+        ),
+    )
+    _, error = _lower_capture(func, expect_error=True)
+    assert error is not None, "an unadmitted node in a predicate must be rejected"
+    assert "FloorMod" in str(error), f"unexpected diagnostic: {error}"
+
+
+@pytest.mark.pto
+def test_predicate_with_an_external_call_is_rejected():
+    """An external call in a predicate could carry a side effect.
+
+    Dropping a provably-true predicate would silently delete that call, so the
+    whitelist must reject it before the truth proof.
+    """
+    func = _append_region_level_access(
+        _k_plain_two_stores(),
+        "load",
+        lambda: tvm.tirx.Or(
+            tvm.tirx.const(True, "bool"),
+            tvm.tirx.call_extern("bool", "predicate_effect"),
+        ),
+    )
+    _, error = _lower_capture(func, expect_error=True)
+    assert error is not None, "an external call in a predicate must be rejected"
+    assert "unsupported Call" in str(error), f"unexpected diagnostic: {error}"

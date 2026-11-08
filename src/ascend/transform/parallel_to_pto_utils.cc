@@ -1866,38 +1866,164 @@ const RelationalKind *RelationalByName(const char *cmp) {
 // Collect a flat list of BufferStores from a stmt (single store or Seq of
 // stores). Nested Seq allowed; anything that is neither store nor no-op aborts
 // collection.
-// Handle-valued Binds: `Bind(q, A.data)` makes q a second view of A's
-// storage. The map answers "which buffer data Var does this pointer denote",
-// with nullptr for pointers that do not resolve to a buffer (external
-// pointers, reinterpret casts). Verify uses it to scope the alias contract;
-// Legalize resolves through it so ordering and pairing compare the resolved
-// storage instead of the view.
-void CollectHandleBindAliases(
-    const Stmt &stmt, std::map<const VarNode *, const VarNode *> *out) {
+bool IsProvablyTruePredicate(const PrimExpr &predicate,
+                             arith::Analyzer *analyzer,
+                             const Map<Var, PrimExpr> &bind_env) {
+  // Resolve the pass's scalar Bind values first: a `Bind`-defined bool is a
+  // known value to both passes, and Verify already checked those references.
+  class BindSubstituter : public tirx::ExprMutator {
+   public:
+    explicit BindSubstituter(const Map<Var, PrimExpr> &env) : env_(env) {}
+    PrimExpr VisitExpr_(const VarNode *op) final {
+      auto it = env_.find(GetRef<Var>(op));
+      return it != env_.end() ? (*it).second : GetRef<PrimExpr>(op);
+    }
+
+   private:
+    const Map<Var, PrimExpr> &env_;
+  };
+  PrimExpr value = predicate;
+  if (!bind_env.empty()) {
+    // A Bind value may itself reference another bound var; a couple of rounds
+    // resolve the shallow chains these passes admit without a fixpoint search.
+    for (int round = 0; round < 3; ++round) {
+      BindSubstituter substituter(bind_env);
+      PrimExpr next = substituter(std::move(value));
+      if (next.same_as(value)) {
+        break;
+      }
+      value = std::move(next);
+    }
+  }
+  const PrimExpr folded = analyzer->Simplify(value);
+  // CanProve covers the constant case and the range facts bound into the
+  // analyzer (a loop bound makes `_t < extent` provable, for instance).
+  return analyzer->CanProve(folded);
+}
+
+// Handle-valued Binds: `Bind(q, A.data)` makes q a pointer the lane analysis
+// cannot follow. Record the target Vars only; resolving their origin was
+// unsound (a handle BufferLoad holds a pointer value, not the storage that
+// contains it) and let two admission bypasses through.
+void CollectHandleBindTargets(const Stmt &stmt,
+                              std::set<const VarNode *> *out) {
   class Collector : public tirx::StmtExprVisitor {
    public:
-    explicit Collector(std::map<const VarNode *, const VarNode *> *out)
-        : out_(out) {}
+    explicit Collector(std::set<const VarNode *> *out) : out_(out) {}
     void VisitStmt_(const tirx::BindNode *op) final {
       if (op->value.dtype().is_handle()) {
-        const VarNode *src = nullptr;
-        if (const auto *load = op->value.as<tirx::BufferLoadNode>()) {
-          src = load->buffer->data.get();
-        } else if (const auto *var = op->value.as<tirx::VarNode>()) {
-          src = var;  // chained bind: resolve through the map at query time
-        }
-        out_->emplace(op->var.get(), src);  // first definition wins
+        out_->insert(op->var.get());
       }
       tirx::StmtExprVisitor::VisitStmt_(op);
     }
 
    private:
-    std::map<const VarNode *, const VarNode *> *out_;
+    std::set<const VarNode *> *out_;
   };
   Collector collector(out);
   collector(stmt);
 }
 
+StorageOrigins CollectStorageOrigins(const Stmt &body,
+                                     const Map<Var, Buffer> &buffer_map,
+                                     bool no_alias,
+                                     const Array<Var> &non_restrict_params) {
+  StorageOrigins origins;
+  origins.no_alias = no_alias;
+  for (const auto &kv : buffer_map) {
+    origins.parameters.insert(kv.second->data.get());
+  }
+  auto add_non_restrict = [&origins, &buffer_map](const Var &var) {
+    if (!var.defined()) {
+      return;
+    }
+    origins.non_restrict.insert(var.get());
+    // The frontend may name the handle parameter or its data Var.
+    if (auto buffer = buffer_map.Get(var)) {
+      origins.non_restrict.insert(buffer.value()->data.get());
+    }
+  };
+  for (const Var &var : non_restrict_params) {
+    add_non_restrict(var);
+  }
+
+  class Collector : public tirx::StmtExprVisitor {
+   public:
+    explicit Collector(StorageOrigins *out) : out_(out) {}
+    // An allocation normally lives in the block's `alloc_buffers` field, not in
+    // a statement, so the block is the primary source. The same visit also
+    // picks up a `tl.non_restrict_params` written as a block annotation: the
+    // hoisting pass that turns it into a function attribute runs later.
+    void VisitStmt_(const tirx::SBlockNode *op) final {
+      for (const Buffer &buffer : op->alloc_buffers) {
+        out_->allocations.insert(buffer->data.get());
+      }
+      auto it = op->annotations.find(tl::attr::kNonRestrictParams);
+      if (it != op->annotations.end()) {
+        if (const auto *arr = (*it).second.as<ArrayObj>()) {
+          for (const Var &var : Downcast<Array<Var>>((*it).second)) {
+            if (var.defined()) {
+              out_->non_restrict.insert(var.get());
+            }
+          }
+        }
+      }
+      tirx::StmtExprVisitor::VisitStmt_(op);
+    }
+    // `T.alloc_buffer`-style statements outside a block still allocate.
+    void VisitStmt_(const tirx::AllocBufferNode *op) final {
+      out_->allocations.insert(op->buffer->data.get());
+      tirx::StmtExprVisitor::VisitStmt_(op);
+    }
+
+   private:
+    StorageOrigins *out_;
+  };
+  Collector collector(&origins);
+  collector(body);
+  // Block annotations also name the handle parameter; map them to the data Var
+  // the conflict test compares, the same way the attribute path does.
+  for (const VarNode *var : std::set<const VarNode *>(origins.non_restrict)) {
+    if (auto buffer = buffer_map.Get(GetRef<Var>(var))) {
+      origins.non_restrict.insert(buffer.value()->data.get());
+    }
+  }
+  return origins;
+}
+
+bool MayConflictStorage(const BufferNode *lhs, const BufferNode *rhs,
+                        const StorageOrigins &origins) {
+  const VarNode *lhs_var = lhs->data.get();
+  const VarNode *rhs_var = rhs->data.get();
+  if (lhs_var == rhs_var) {
+    return true;
+  }
+  // Two real allocations are distinct storage by construction.
+  if (origins.allocations.count(lhs_var) != 0 &&
+      origins.allocations.count(rhs_var) != 0) {
+    return false;
+  }
+  // Two parameters are distinct only under an explicit no-alias contract, and
+  // even then a non-restrict parameter may alias any other storage.
+  if (origins.parameters.count(lhs_var) != 0 &&
+      origins.parameters.count(rhs_var) != 0) {
+    if (!origins.no_alias) {
+      return true;
+    }
+    return origins.non_restrict.count(lhs_var) != 0 ||
+           origins.non_restrict.count(rhs_var) != 0;
+  }
+  // An allocation against a parameter, or a pointer with no origin we can name,
+  // stays conservatively conflicting.
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Branch-rewrite helpers shared by Verify / Legalize / Vectorize
+// ---------------------------------------------------------------------------
+// Collect a flat list of BufferStores from a stmt (single store or Seq of
+// stores). Nested Seq allowed; anything that is neither store nor no-op aborts
+// collection.
 bool CollectStores(const Stmt &stmt,
                    std::vector<const BufferStoreNode *> *out) {
   if (const auto *store = stmt.as<BufferStoreNode>()) {

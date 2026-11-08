@@ -64,7 +64,7 @@ public:
       defs_.insert(kv.second->data.get());
     }
     CollectVolatileAllocs(f->body);
-    pto::CollectHandleBindAliases(f->body, &alias_src_);
+    pto::CollectHandleBindTargets(f->body, &handle_bind_targets_);
     VisitStmt(f->body);
   }
 
@@ -252,19 +252,20 @@ private:
 
   private:
     void CheckScope(const Buffer &buffer) {
-      // A data pointer bound by a handle Bind (Bind(q, A.data); DeclBuffer(B,
-      // data=q)) is a second view of one storage. When the bound value
-      // resolves to a buffer data Var, the pairing/ordering analysis follows
-      // the alias, so the view is admitted; pointers with no resolvable
-      // buffer source (external pointers, reinterpret casts) stay rejected.
-      auto alias_it = parent_->alias_src_.find(buffer->data.get());
-      if (alias_it != parent_->alias_src_.end() &&
-          alias_it->second == nullptr) {
+      // A buffer declared over a pointer a handle Bind produced (Bind(q,
+      // A.data); DeclBuffer(B, data=q)) is a view whose storage the lane
+      // analysis cannot follow: q may be an external pointer, a reinterpret
+      // cast or a laundered copy, and the origin says nothing about where the
+      // view really lives. Reject the access itself instead of letting the
+      // ordering analysis guess -- a conservative ordering cannot repair an
+      // access that should never have been admitted (a volatile read or a
+      // cast the ISA cannot perform, for instance).
+      if (parent_->handle_bind_targets_.count(buffer->data.get()) != 0) {
         std::ostringstream oss;
         oss << "buffer `" << buffer->name
-            << "` is declared over a bound data pointer whose source cannot "
-               "be resolved (an external pointer or a reinterpret cast), "
-               "which is not supported inside a converting region";
+            << "` is declared over a data pointer bound by a handle Bind, "
+               "which is not supported inside a converting region; access the "
+               "buffer the pointer came from instead";
         parent_->Fail("memory access", oss.str());
       }
       // Volatile accesses are outside the supported contract
@@ -473,6 +474,11 @@ private:
         CheckDefinedVars(op->step.value());
       }
       defined_loop_vars_.insert(op->loop_var.get());
+      // The range is a fact, not an assumption: a predicate like `_t < extent`
+      // is provably true here, and the same fact is bound in Legalize before it
+      // normalises a predicate away.
+      analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent),
+                     /*allow_override=*/true);
       Map<Var, PrimExpr> saved_env = bind_env_;
       Map<Var, Integer> saved_classified = classified_;
       classified_.Set(op->loop_var, Integer(0));
@@ -1109,18 +1115,11 @@ private:
 
     void VerifyAccess(const Buffer &buffer, const Array<PrimExpr> &indices,
                       bool is_write, const Optional<PrimExpr> &predicate) {
-      // A predicated access has no lowering: the vectorizer writes whole
-      // chunks, so a predicate could only be honoured by a store mask or a
-      // destination read-back. Reject the field itself -- dropping even a
-      // provably-true predicate would turn a conditional write into an
-      // unconditional one.
+      // The predicate *value* is admitted by AdmitPredicates, which runs once
+      // per converting region and owns the lexical facts. Only the reference
+      // check is repeated here, next to the access it belongs to.
       if (predicate.defined()) {
         CheckDefinedVars(predicate.value());
-        std::ostringstream oss;
-        oss << "buffer `" << buffer->name
-            << "` carries an access predicate; predicated load/store is not "
-               "supported, remove the predicate from the source";
-        parent_->Fail("memory access", oss.str());
       }
       auto kind = parent_->storage_.Classify(buffer, parent_->current_unit_);
       if (kind == pto::StorageClass::kPrivate ||
@@ -1223,9 +1222,9 @@ private:
     // Flat sequence semantics: the bound var is visible to all
     // subsequent statements of the enclosing scope; the scope owners
     // above restore the environment on exit.
-    // A handle-valued Bind aliases a data pointer (Bind(q, A.data)); the
-    // function-level pre-pass has recorded the alias in alias_src_, so the
-    // scope checks resolve the view's storage through it. Plain PTO
+    // A handle-valued Bind (Bind(q, A.data)) produces a pointer the lane
+    // analysis cannot follow; the function-level pre-pass records its target
+    // so any view declared over it is rejected by CheckScope. Plain PTO
     // functions without a converting region keep their behaviour.
     defs_.insert(op->var.get());
     StmtExprVisitor::VisitStmt_(op);
@@ -1324,6 +1323,13 @@ private:
     // Region-level checks across the whole converting region.
     RegionVisitor region_visitor(this);
     region_visitor(region);
+
+    // Access-predicate admission, with the lexical facts a predicate may rest
+    // on (enclosing loop ranges, scalar Bind values). A hand-written VMI region
+    // without a unit keeps its old behaviour.
+    if (!units.empty()) {
+      AdmitPredicates(region);
+    }
 
     // Per-unit checks in order (multiple sequential units OK) against the
     // lexical definition snapshot at each unit's position.
@@ -1507,6 +1513,137 @@ private:
   // the discovered units themselves; IfThenElse/While cannot contain
   // units (the scan rejected that), and unit bodies belong to the
   // UnitVisitor.
+  // Predicate admission for one converting region.
+  //
+  // A predicate has no lowering: the vectorizer writes whole chunks, so
+  // honouring one would need a store mask or a destination read-back, and
+  // dropping it would turn a conditional access into an unconditional one. Only
+  // a predicate that provably holds everywhere is therefore admitted, and
+  // Legalize's region-wide normaliser then clears the field before folding.
+  //
+  // The walk carries the lexical facts the predicate may rest on -- the
+  // enclosing loop ranges and the scalar `Bind` values -- because a predicate
+  // like `j < 8` over an outer serial index is provable only with them. Both
+  // passes track the same facts, which is what keeps their verdicts aligned.
+  void AdmitPredicates(const Stmt &body) {
+    class Admission : public StmtExprVisitor {
+     public:
+      Admission(VerifyParallelToPTOImpl *parent, std::set<const VarNode *> defs)
+          : parent_(parent), defs_(std::move(defs)) {}
+
+      void VisitStmt_(const ForNode *op) final {
+        analyzer_.Bind(op->loop_var, Range::FromMinExtent(op->min, op->extent),
+                       /*allow_override=*/true);
+        std::set<const VarNode *> saved = defs_;
+        defs_.insert(op->loop_var.get());
+        StmtExprVisitor::VisitStmt_(op);
+        defs_ = std::move(saved);
+      }
+      void VisitStmt_(const SBlockNode *op) final {
+        VisitScopedBlock(op->iter_vars, op->alloc_buffers, op->body);
+      }
+      void VisitStmt_(const SBlockRealizeNode *op) final {
+        VisitScopedBlock(op->block->iter_vars, op->block->alloc_buffers,
+                         op->block->body);
+      }
+      void VisitStmt_(const BindNode *op) final {
+        StmtExprVisitor::VisitStmt_(op);
+        if (!op->value.dtype().is_handle()) {
+          env_.Set(op->var, op->value);
+        }
+        defs_.insert(op->var.get());
+      }
+      void VisitStmt_(const AllocBufferNode *op) final {
+        defs_.insert(op->buffer->data.get());
+        StmtExprVisitor::VisitStmt_(op);
+      }
+      void VisitStmt_(const DeclBufferNode *op) final {
+        defs_.insert(op->buffer->data.get());
+        StmtExprVisitor::VisitStmt_(op);
+      }
+      // The predicate field of a load/store is not on the base visitor's
+      // descent path, so both access kinds admit it explicitly. This is the one
+      // place a predicate is judged: references first (against the lexical
+      // environment), then whether it provably holds. Doing both here keeps a
+      // region-level load from slipping through the reference check that the
+      // store path already had.
+      void VisitStmt_(const BufferStoreNode *op) final {
+        Admit(op->predicate, op->buffer->name);
+        StmtExprVisitor::VisitStmt_(op);
+      }
+      void VisitExpr_(const BufferLoadNode *op) final {
+        Admit(op->predicate, op->buffer->name);
+        StmtExprVisitor::VisitExpr_(op);
+      }
+
+     private:
+      void VisitScopedBlock(const Array<IterVar> &iter_vars,
+                            const Array<Buffer> &alloc_buffers,
+                            const Stmt &body) {
+        std::set<const VarNode *> saved = defs_;
+        for (const IterVar &iv : iter_vars) {
+          defs_.insert(iv->var.get());
+        }
+        for (const Buffer &buffer : alloc_buffers) {
+          defs_.insert(buffer->data.get());
+        }
+        StmtExprVisitor::VisitStmt(body);
+        defs_ = std::move(saved);
+      }
+
+      void Admit(const Optional<PrimExpr> &predicate, const String &name) {
+        if (!predicate.defined()) {
+          return;
+        }
+        // Runs before any simplification: folding `True | ghost` to True would
+        // hide the undefined reference.
+        PostOrderVisit(predicate.value(), [&](const ObjectRef &node) {
+          if (const auto *var = node.as<VarNode>()) {
+            if (defs_.count(var) == 0) {
+              std::ostringstream oss;
+              oss << "buffer `" << name
+                  << "` carries an access predicate that references variable `"
+                  << var->name_hint
+                  << "`, which is not defined in the lexical scope of this "
+                     "SIMD_VF region";
+              parent_->Fail("expression", oss.str());
+            }
+          }
+        });
+        // The predicate is an expression position like any other, and it is
+        // dropped after admission. An unadmitted node that the analyzer folds
+        // away (`True | call_extern(...)`, `True | (p % 2 == 0)`) would
+        // therefore never be seen by a later pass -- an external call could even
+        // carry a side effect that the removal silently discards. Run the same
+        // whitelist the compute-value positions run, on the original tree and
+        // before the truth proof.
+        if (auto reason = pto_analysis::FindUnsupportedExprNode(predicate.value())) {
+          parent_->Fail("expression",
+                        "access predicate on buffer `" + std::string(name) +
+                            "`: " + reason.value());
+        }
+        if (!pto_analysis::IsProvablyTruePredicate(predicate.value(),
+                                                   &analyzer_, env_)) {
+          std::ostringstream oss;
+          oss << "buffer `" << name
+              << "` carries an access predicate that is not provably true; a "
+                 "predicated access has no lowering, so only a "
+                 "compile-time-true predicate is accepted (and then ignored)";
+          parent_->Fail("memory access", oss.str());
+        }
+      }
+
+      VerifyParallelToPTOImpl *parent_;
+      arith::Analyzer analyzer_;
+      Map<Var, PrimExpr> env_;
+      std::set<const VarNode *> defs_;
+    };
+    // Seed with the definition snapshot at the region's lexical position
+    // (parameters, enclosing block variables, allocations before the region).
+    Admission admission(this, defs_);
+    admission(body);
+  }
+
   void WalkRegion(const Stmt &stmt, const std::vector<For> &units,
                   int64_t lanes, size_t *next_unit) {
     if (const auto *for_node = stmt.as<ForNode>()) {
@@ -1621,14 +1758,8 @@ private:
       for (const auto &idx : store->indices) {
         CheckRegionExprDefined(idx, "region-level store index");
       }
-      if (store->predicate.defined()) {
-        SetRegionContext();
-        std::ostringstream oss;
-        oss << "region-level store into buffer `" << store->buffer->name
-            << "` carries an access predicate; predicated store is not "
-               "supported, remove the predicate from the source";
-        Fail("memory access", oss.str());
-      }
+      // The predicate (references and provable truth) is admitted by
+      // AdmitPredicates for every load and store alike.
       return;
     }
     if (const auto *eval = stmt.as<EvaluateNode>()) {
@@ -1671,12 +1802,11 @@ private:
   // (blockIdx, outer/VF-internal binds) and leaked sibling-scope loop
   // vars into every unit.
   std::set<const VarNode *> defs_;
-  // Handle-valued Binds seen anywhere in the function: each bound data
-  // pointer maps to the Var it is bound from, or to nullptr when the bound
-  // value is not a plain buffer data reference. A buffer declared over a
-  // mapped pointer is a second view of one storage; only pointers with no
-  // resolvable source stay rejected (see CheckScope).
-  std::map<const VarNode *, const VarNode *> alias_src_;
+  // Target Vars of the handle-valued Binds seen anywhere in the function
+  // (collected function-wide by CollectHandleBindTargets). A buffer declared
+  // over one of these pointers is a view the lane analysis cannot follow, so
+  // every access to it is rejected (see CheckScope).
+  std::set<const VarNode *> handle_bind_targets_;
   // Data Vars of AllocBuffers annotated tirx.volatile (collected
   // function-wide by CollectVolatileAllocs; identity-matched at every
   // access inside a converting region).
