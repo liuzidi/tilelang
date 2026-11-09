@@ -672,6 +672,10 @@ private:
     // error. The shifted window's 32-byte alignment is codegen legality's
     // contract (VerifyPTOCodegenLegality), not this rule's.
     void CheckPairedDestination(const BufferStoreNode *store) {
+      if (parent_->storage_.Classify(store->buffer, parent_->current_unit_) ==
+          pto::StorageClass::kPrivate) {
+        return;  // VerifyAccess already validated this lane-private slot.
+      }
       if (!pto_analysis::IsPairableDestination(store->indices, loop_var_)) {
         std::ostringstream oss;
         oss << "buffer `" << store->buffer->name

@@ -30,6 +30,7 @@
 #include <vector>
 
 #include "parallel_to_pto_utils.h"
+#include "../pto_parallel_storage.h"
 
 #include "../target_utils.h"
 
@@ -157,6 +158,10 @@ public:
     // a hand-written VMI region (SIMD_VF without a unit) stays untouched.
     bool saved = in_simd_vf_;
     in_simd_vf_ = true;
+    // Predicate normalization can rebuild the loop owning a private slot.
+    SBlock storage_region = GetRef<SBlock>(op);
+    storage_region.CopyOnWrite()->body = normalized;
+    storage_.Build(storage_region);
     Stmt body = StmtExprMutator::VisitStmt(normalized);
     in_simd_vf_ = saved;
     SBlock block = GetRef<SBlock>(op);
@@ -245,9 +250,11 @@ public:
       return StmtExprMutator::VisitStmt_(op);
     }
 
+    For saved_unit = current_unit_;
     Var saved_var = parallel_var_;
     bool saved_in = in_parallel_;
     if (!in_parallel_) {
+      current_unit_ = GetRef<For>(op);
       // Unit entry. Verify picks the vectorized coordinate through the layout
       // annotation and checks a conditional store's last index against it;
       // this pass must judge the same index against that variable too, not
@@ -278,6 +285,7 @@ public:
       loop.CopyOnWrite()->body = body;
     }
 
+    current_unit_ = saved_unit;
     parallel_var_ = saved_var;
     in_parallel_ = saved_in;
     return loop;
@@ -390,8 +398,14 @@ public:
   // caller's and codegen legality's contracts. The form check is shared with
   // Verify's CheckPairedDestination so the two passes cannot drift apart (the 2D
   // lane-variable divergence was exactly such a drift).
-  bool IsPerLaneAddress(const Array<PrimExpr> &indices) const {
-    return pto::IsPairableDestination(indices, parallel_var_);
+  bool IsPerLaneAddress(const BufferStore &store) {
+    if (storage_.Classify(store->buffer, current_unit_) ==
+        pto::StorageClass::kPrivate) {
+      storage_.CheckStorageV1(store->buffer);
+      storage_.ResolveSlot(store->buffer, store->indices, &predicate_analyzer_);
+      return true;
+    }
+    return pto::IsPairableDestination(store->indices, parallel_var_);
   }
   static bool CollectPlanTasks(const Stmt &stmt, std::vector<PlanTask> *out) {
     if (const auto *seq = stmt.as<SeqStmtNode>()) {
@@ -480,13 +494,13 @@ public:
     // be lane-private. Condition Binds have no destination and need no such check.
     for (const PlanTask &task : then_stores) {
       if (task.store != nullptr &&
-          !IsPerLaneAddress(task.store->indices)) {
+          !IsPerLaneAddress(GetRef<BufferStore>(task.store))) {
         return false;
       }
     }
     for (const PlanTask &task : else_stores) {
       if (task.store != nullptr &&
-          !IsPerLaneAddress(task.store->indices)) {
+          !IsPerLaneAddress(GetRef<BufferStore>(task.store))) {
         return false;
       }
     }
@@ -778,6 +792,8 @@ public:
   }
   bool in_simd_vf_ = false;
   bool in_parallel_ = false;
+  pto::ParallelStorageQuery storage_;
+  For current_unit_;
   Var parallel_var_;
   int condition_serial_ = 0;
   // Storage origins: which data Vars are real allocations and which are
