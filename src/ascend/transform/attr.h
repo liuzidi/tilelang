@@ -37,6 +37,9 @@ constexpr const char *kAscendStage = "tl.ascend_stage";
 // grouping or core-placement semantics.
 constexpr const char *kScheduleUnit = "tl.schedule_unit";
 
+// Accumulators whose lane partials persist across Parallel chunks.
+constexpr const char *kPtoReducerStates = "tl.pto.reducer_states";
+
 // Source ownership of ordinary private allocations on a Parallel unit root.
 constexpr const char *kParallelPrivateAllocs = "tl.parallel_private_allocs";
 

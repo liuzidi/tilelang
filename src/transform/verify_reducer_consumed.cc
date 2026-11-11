@@ -34,6 +34,8 @@ void CheckFunc(const PrimFunc &f) {
             << "` (scope local.reducer) survived past "
                "ReducerPlanAndMaterialize; it was never materialized.";
       }
+      ICHECK(!block->annotations.count("tl.pto.reducer_states"))
+          << "internal error: unconsumed PTO reducer state metadata";
       ICHECK(!block->annotations.count(attr::kReducerInfoV2))
           << "internal error: reducer_info_v2 annotation survived past "
              "ReducerPlanAndMaterialize.";
@@ -51,6 +53,9 @@ void CheckFunc(const PrimFunc &f) {
         }
       }
     } else if (const auto *call = obj.as<CallNode>()) {
+      if (const auto *op = call->op.as<OpNode>())
+        ICHECK(op->name != "tl.tileop.pto_finalize_reducer")
+            << "internal error: unconsumed PTO finalize";
       ICHECK(!call->op.same_as(ReducerInitOp::Get()) &&
              !call->op.same_as(reducer_update()) &&
              !call->op.same_as(FinalizeReducerV2Op::Get()))
