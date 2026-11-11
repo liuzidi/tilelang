@@ -93,11 +93,10 @@ PR 描述说明行为、支持边界、PR38 依赖、测试命令及实际结果
 - [x] 开发计划落盘。
 - [x] 依赖基线验证与缺口定位。
 - [x] reducer 编译链与示例实现。
-- [ ] 主机回归、PTOAS 与设备数值验证。
-- [ ] 提交代码并创建以 PR38 分支为 base 的 PR。
+- [x] 主机回归、PTOAS 与设备数值验证。
+- [x] 提交代码并创建以 PR38 分支为 base 的 PR：https://github.com/liuzidi/tilelang/pull/1 。
 
-当前记录：PR38 文档明确内部控制流尚未集成，条件 local 更新不能假定已经可用。
-需核对控制流 PR 与当前基线的具体差异；在本分支完成必要集成或明确阻塞证据。
+依赖核对结果及本分支补入范围见下方“当前依赖边界”。
 
 ## 实现说明与依赖集成
 
@@ -173,14 +172,14 @@ vmax/vmin 与 vcmax/vcmin；有限非零输入精确比较。源 TIR Max/Min 和
 - 主机构建：`USE_ASCEND=ON` 完整构建通过；`USE_ASCEND=OFF` 单独配置并编译通用
   `reducer_plan_materialize.cc.o`，证明该文件不依赖 Ascend-only 实现（不是完整非
   Ascend 构建验证）。
-- 主机专项及回归：348 passed。命令见下；4 个设备用例明确 deselect，未计入通过。
+- 主机专项及回归：348 passed；新增 4 个 finalize region 负例另行通过（reducer 专项共 104 passed）。命令见下；4 个设备用例明确 deselect，未计入通过。
 - 额外尝试的 CUDA reducer 套件在本环境因无 CUDA、目标默认 Ascend 与旧式无 VF
   写法不兼容而失败；14 个 CUDA scalar-candidate 用例 skip。两者均不列入通过项。
 - PTOAS 运行包从 `ptoas-shared-memory-analysis-20261110` 的构建树独立复制并逐文件
   校验，源 HEAD=`476e8ce513273e364b7b22ab403f5be57bf054fd`。源工作树有其他任务的
   未提交修改，因此 **HEAD 不能单独代表此构建**；保留 source.patch、运行包 SHA256
   manifest 和实际动态库加载路径，以冻结包为验证身份。未改动其他任务的源码。
-- CANN 9.2.0；Python 3.11 / tilelang-a5。缓存、临时目录和 PTOAS 运行包均独立于
+- CANN 实际路径 `/usr/local/Ascend/cann-9.2.1`（旧 9.2.0 环境入口是指向它的符号链接）；Python 3.11 / tilelang-a5。缓存、临时目录和 PTOAS 运行包均独立于
   日常开发目录。设备运行前验证 TileLang 源码/动态库与 PTOAS 全包指纹。
 
 ```bash
@@ -199,4 +198,21 @@ python -m pytest \
 本机可追溯证据目录 `/home/liuzidi/reducer-validation/`：
 `host-release.log`、`tilelang-manifest.json`、`ptoas-frozen/manifest.json`、
 `ptoas-frozen/source.patch`、`final-env.sh`、`check-frozen.py`。
-设备最终结果与 PR 链接在发布时补充。
+设备最终结果与 PR 链接见下节。
+
+### 最终编译与设备结果
+
+- 48/48 个不同内核通过完整 PTOAS 与设备编译，包括所有 VL256 组合及独立示例。
+- 独立示例 `example_pto_simd_reducer.py` 上板通过，输出 `PTO SIMD reducer passed`。
+- NPU 1：`test_pto_simd_reducer_run.py` **56 passed，238.40s**，无 skip。
+  覆盖 36 个 dtype/op/width/extent 基础组合、4 个 one-lane 除法、6 个条件/seed
+  组合、3 个 seed 快照/重复 epoch、1 个 direct reduce 混合用例、6 个一般浮点输入。
+- 设备任务：`task_20261111_183912_2977031`。此前设备 0 的 pending 任务已取消；
+  设备 1 的首批运行因默认 600 秒限制主动终止重提，不把首批部分结果算作完整通过。
+- 验证的代码提交：`3e236e26ea725a534ac60d6e0f7735f74b3b01d8`；之后仅补充本文档。
+- `libtilelang.so` SHA256：`6f6c7f806fd53d8c47e51ba018088292dc3264753bed44a54f01e99f4d7f37ec`。
+- PTOAS compiler DSO SHA256：`1e276c78de76e6e491a6a1b410ca707d152690bf8a3b8009c0252aa6eb14f82b`。
+- 日志：`release-compile-resumed.log`、`device-final.log`；产物摘要：
+  `generated-pto-sha256.json`。缓存命名空间在代码提交后随 git 版本改变，最终设备
+  运行对未命中的内核重新编译；所有最终进程使用同一冻结运行包和相同 native 构建。
+- PR：https://github.com/liuzidi/tilelang/pull/1 ，base 为 `feat/pto-parallel-private-alloc`。
