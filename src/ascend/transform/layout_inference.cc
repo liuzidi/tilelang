@@ -614,6 +614,38 @@ public:
       pto_loop_layouts_.Set(unit.root, layout);
     }
 
+    std::unordered_map<const VarNode *, int> update_counts;
+    for (const auto &unit : pto_parallel_units_)
+      for (const auto &update : unit.reducer_updates)
+        ++update_counts[update.reducer->data.get()];
+    for (const auto &[buffer, bounds] : pto_reducer_bounds_)
+      if (update_counts[buffer->data.get()] != 1)
+        layout_map.Set(buffer, PartialFragment::FullyReplicated(
+                                   buffer->shape, bounds->extent, bounds));
+    for (const auto &unit : pto_parallel_units_) {
+      Array<Var> vars;
+      const ForNode *loop = unit.root.get();
+      while (loop && loop->kind == ForKind::kParallel) {
+        vars.push_back(loop->loop_var);
+        loop = loop->body.as<ForNode>();
+      }
+      for (const auto &update : unit.reducer_updates) {
+        if (update_counts[update.reducer->data.get()] != 1)
+          continue;
+        ReducerUpdateSiteHint site{pto_loop_layouts_[unit.root], vars,
+                                   update.indices, update.value};
+        auto analysis = AnalyzeReducerUpdateSite(
+            site, update.reducer->shape,
+            *as_const_int(unit.lane_bounds->extent),
+            *as_const_int(unit.lane_bounds->min), &analyzer_);
+        ICHECK(analysis.narrow_eligible)
+            << "PTO reducer update layout: " << analysis.reason;
+        layout_map.Set(update.reducer,
+                       PartialFragment::FromInduced(
+                           analysis.induced, Integer(analysis.combine_size)));
+      }
+    }
+
     Map<Buffer, Layout> strict_layout_map;
     int num_infer = infer_list_.size();
 
@@ -880,6 +912,14 @@ private:
     if (op->op.as<GlobalVarNode>())
       return;
 
+    // PTO finalization has an independent ordinary-local destination. Its
+    // virtual partial layout is supplied by the PTO update sites below.
+    if (InsidePtoSimdVF() && op->op.same_as(FinalizeReducerV2Op::Get())) {
+      Buffer reducer =
+          Downcast<BufferLoad>(Downcast<Call>(op->args[0])->args[0])->buffer;
+      pto_reducer_bounds_.Set(reducer, CurrentPtoLaneBounds());
+      return;
+    }
     TileOperator p;
     try {
       p = ParseOperator(GetRef<Call>(op));
@@ -1058,8 +1098,14 @@ private:
         // unit is recorded; nested Parallel layers are part of this unit.
         // Defer inference until collection has finished so later constraint
         // producers (e.g. Fragment buffers) can be collected first.
-        pto_parallel_units_.push_back(
-            {GetRef<For>(op), CurrentPtoLaneBounds()});
+        PtoParallelUnit unit{GetRef<For>(op), CurrentPtoLaneBounds(), {}};
+        PostOrderVisit(op->body, [&](const ObjectRef &node) {
+          if (const auto *call = node.as<CallNode>()) {
+            if (call->op.same_as(reducer_update()))
+              unit.reducer_updates.push_back(ParseReducerUpdate(call));
+          }
+        });
+        pto_parallel_units_.push_back(std::move(unit));
         return;
       }
 
@@ -1474,6 +1520,7 @@ private:
   struct PtoParallelUnit {
     For root;
     Range lane_bounds;
+    std::vector<ReducerUpdateArgs> reducer_updates;
   };
   // PTO SIMD_VF nesting stack. Only non-empty on the PTO target: entering a
   // SIMD_VF block under a non-PTO target keeps the stack empty so the
@@ -1492,6 +1539,7 @@ private:
   // are solved directly from the nest and never enter infer_list_ or the
   // generic layout worklist.
   Map<For, Fragment> pto_loop_layouts_;
+  Map<Buffer, Range> pto_reducer_bounds_;
   // Per-infer-list flag: this op was collected inside a PTO SIMD_VF block.
   std::vector<bool> in_pto_simd_vf_vec_;
   // Lane bounds [0, L) captured when the op was collected (valid only when
@@ -1845,12 +1893,9 @@ private:
       if (!ContainsPtoSimdRoot(op->body)) {
         return ffi::GetRef<Stmt>(op);
       }
-      // Descend for the lane annotations; only the kLayoutMap writeback is
-      // skipped for the block itself.
       SBlock block = Downcast<SBlock>(IRMutatorWithAnalyzer::VisitStmt_(op));
-      if (block.same_as(GetRef<SBlock>(op))) {
-        return ffi::GetRef<Stmt>(op);
-      }
+      block.CopyOnWrite()->annotations.Set(attr::kLayoutMap,
+                                           result_.layout_map);
       return block;
     }
     SBlock block = Downcast<SBlock>(IRMutatorWithAnalyzer::VisitStmt_(op));

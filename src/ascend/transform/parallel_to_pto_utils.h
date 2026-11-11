@@ -11,6 +11,7 @@
 #ifndef TVM_TL_ASCEND_TRANSFORM_PARALLEL_TO_PTO_UTILS_H_
 #define TVM_TL_ASCEND_TRANSFORM_PARALLEL_TO_PTO_UTILS_H_
 
+#include "../op/pto_finalize_reducer.h"
 #include "support/check.h"
 #include <tvm/arith/analyzer.h>
 #include <tvm/arith/iter_affine_map.h>
@@ -21,6 +22,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -41,6 +43,37 @@ using ffi::ObjectRef;
 using ffi::Optional;
 
 namespace pto {
+
+// Value representation is independent of scalar-looking TIR dtypes.
+enum class ValueKind { kScalar, kVmi, kVectorVmi = kVmi };
+struct ValueInfo {
+  ValueKind kind{ValueKind::kScalar};
+  int64_t logical_lanes{1};
+};
+using ValueInfoMap =
+    std::unordered_map<Var, ValueInfo, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
+struct PtoReducerFinalizeSite {
+  Evaluate statement;
+  PtoFinalizeReducerOp op;
+};
+struct PtoReducerStates {
+  int64_t lanes{0};
+  Map<Var, Buffer> accumulators;
+  std::vector<PtoReducerFinalizeSite> finalizes;
+  ValueInfoMap storage_values;
+};
+PtoReducerStates CollectReducerStates(const SBlock &vf,
+                                      const ParallelStorageQuery &storage);
+int64_t AnalyzePtoFinalize(const PtoFinalizeReducerOp &op,
+                           const PtoReducerStates &states);
+Stmt LegalizeReducerConditional(const IfThenElseNode *branch,
+                                const PtoReducerStates &states);
+Optional<Buffer> AnalyzeReducerAccess(const PtoReducerStates &states,
+                                      const Buffer &buffer,
+                                      const Array<PrimExpr> &indices,
+                                      const ParallelStorageQuery &storage,
+                                      arith::Analyzer *analyzer,
+                                      const Map<Var, PrimExpr> &bind_env = {});
 
 /*!
  * \brief Classification of one buffer access against the lane mapping.
@@ -197,15 +230,12 @@ bool IsSupportedFloat8(DataType dtype);
 /*! Value category of one value-Cast position.  The kind is supplied by the
  * caller (Verify from AnalyzeLaneUse, Vectorize from the converted input
  * shape); the planner never infers it from lanes. */
-enum class CastValueKind {
-  kScalar,
-  kVectorVmi,
-};
+using CastValueKind = ValueKind;
 
 /*! Per-Cast planning context.  `logical_lanes` is validation information
  * only; `value_kind` is the dispatch key. */
 struct CastContext {
-  CastValueKind value_kind = CastValueKind::kScalar;
+  ValueKind value_kind = ValueKind::kScalar;
   int64_t logical_lanes = 1;
 };
 
@@ -287,6 +317,8 @@ std::string LaneUseToString(LaneUse use);
  * (params / buffer data pointers / outer-scope definitions), and the
  * recursion guards of the classification walk. */
 struct LaneUseContext {
+  const ValueInfoMap *storage_values = nullptr;
+  const ValueInfoMap *value_infos = nullptr;
   const pto::ParallelStorageQuery *storage = nullptr;
   For unit;
   Var loop_var;
@@ -315,6 +347,8 @@ struct LaneUseContext {
  * vars use their recorded classification (on-demand analysis is guarded
  * by the visiting set and budget; cycles and exhaustion -> Unknown).
  * \p reason is filled on kUnknown. */
+ValueInfo AnalyzeComputeValue(const PrimExpr &expr, LaneUseContext *ctx);
+
 LaneUse AnalyzeLaneUse(const PrimExpr &expr, LaneUseContext *ctx,
                        std::string *reason);
 
@@ -361,6 +395,39 @@ Optional<CastPlan> PlanValueCast(const CastNode *cast,
  * supported; otherwise a short description of the offending node. */
 std::optional<std::string> FindUnsupportedExprNode(const PrimExpr &expr);
 
+/*! Logical direct-reduction plan, independent of physical register width. */
+struct PtoDirectReducePlan {
+  BufferRegion source;
+  BufferRegion destination;
+  int source_prefix = 0;
+  int destination_prefix = 0;
+  int logical_rank = 0;
+  int reduction_axis = 0;
+  int output_axis = 0;
+  int destination_output_axis = 0;
+  int64_t reduction_extent = 0;
+  int64_t output_extent = 0;
+  bool reduce_across_lanes = false;
+  bool clear = true;
+  std::string operation;
+  DataType accumulator_dtype;
+};
+
+/*! Whether the call denotes a direct tile reduction. */
+bool IsPtoDirectReduce(const Call &call);
+
+/*! Check direct-reduce admission without building a lowering plan.
+ * Throws PtoAnalysisError for unsupported calls; does not change IR. VF lanes
+ * and lexical structure are checked by VerifyParallelToPTO itself. */
+void CheckPtoDirectReduce(const Call &call, arith::Analyzer *analyzer,
+                          const Map<Var, int> &buffer_versions = {});
+
+/*! Build a direct-reduce lowering plan for already verified input.
+ * Requires CheckPtoDirectReduce and the VF checks to have succeeded. */
+PtoDirectReducePlan
+PlanPtoDirectReduce(const Call &call, arith::Analyzer *analyzer,
+                    const Map<Var, int> &buffer_versions = {});
+
 /*! Result of scanning a SIMD_VF region for parallel units. Shared by
  * Verify and Vectorize so both passes agree on skip/reject/convert
  * decisions. */
@@ -376,6 +443,7 @@ struct PtoRegionScan {
    * under wrappers). A region with none is a pure hand-written VMI
    * region: both passes skip it entirely. */
   bool has_any_parallel = false;
+  bool has_direct_reduce = false;
 };
 
 /*! Scan a SIMD_VF region body (the SBlock's body, including any scope
