@@ -135,16 +135,31 @@ struct EpochInfo {
   // False when some structural prerequisite for plan analysis is missing
   // (e.g. an update site without a solved loop layout).
   bool analyzable{true};
+  bool pto_simd{false};
 };
 
 class ReducerEpochCollector : public IRVisitorWithAnalyzer {
 public:
   std::unordered_map<const VarNode *, EpochInfo> epochs_;
 
-  void Collect(const PrimFunc &f) { VisitStmt(f->body); }
+  void Collect(const PrimFunc &f) {
+    if (auto target = f->GetAttr<Target>(tvm::attr::kTarget))
+      for (const auto &key : target.value()->keys)
+        target_is_pto_ |= key == "pto";
+    VisitStmt(f->body);
+  }
 
 private:
   void VisitStmt_(const SBlockNode *op) final {
+    auto saved_lanes = pto_lanes_;
+    if (target_is_pto_ && op->name_hint == "SIMD_VF") {
+      auto lanes = op->annotations.Get("tl.simdvf_lanes");
+      pto_lanes_ =
+          lanes.has_value() ? Downcast<IntImm>(lanes.value())->value : 0;
+      for (const auto &buffer : op->alloc_buffers)
+        if (IsReducerV2Buffer(buffer))
+          ICHECK(lanes.has_value()) << "PTO reducer requires tl.simdvf_lanes";
+    }
     if (auto anno = op->annotations.Get(attr::kReducerInfoV2)) {
       auto map = anno.value().as<Map<Var, Map<String, Any>>>();
       ICHECK(map) << "malformed reducer_info_v2 annotation";
@@ -159,6 +174,7 @@ private:
       }
     }
     IRVisitorWithAnalyzer::VisitStmt_(op);
+    pto_lanes_ = saved_lanes;
   }
 
   void VisitStmt_(const AttrStmtNode *op) final {
@@ -174,12 +190,13 @@ private:
   }
 
   void VisitStmt_(const ForNode *op) final {
-    if (op->kind == ForKind::kParallel &&
-        op->annotations.count(tl::attr::kParallelLoopLayout)) {
+    const char *layout_key =
+        pto_lanes_ ? "pto_parallel_loop_layout" : tl::attr::kParallelLoopLayout;
+    if (op->kind == ForKind::kParallel && op->annotations.count(layout_key)) {
       auto prev_layout = cur_loop_layout_;
       auto prev_vars = cur_loop_vars_;
-      cur_loop_layout_ = Downcast<Fragment>(
-          op->annotations.Get(tl::attr::kParallelLoopLayout).value());
+      cur_loop_layout_ =
+          Downcast<Fragment>(op->annotations.Get(layout_key).value());
       // Gather the consecutive parallel nest the annotation covers.
       Array<Var> vars;
       const ForNode *cur = op;
@@ -221,8 +238,12 @@ private:
         if (op->args.size() >= 2) {
           epoch->seed = op->args[1];
         }
-        if (thread_var_.defined() &&
-            analyzer_.const_int_bound.IsBound(thread_var_->var)) {
+        if (pto_lanes_) {
+          epoch->pto_simd = true;
+          epoch->thread_min = 0;
+          epoch->thread_extent = pto_lanes_;
+        } else if (thread_var_.defined() &&
+                   analyzer_.const_int_bound.IsBound(thread_var_->var)) {
           auto bound = analyzer_.const_int_bound(thread_var_->var);
           epoch->thread_min = bound->min_value;
           epoch->thread_extent = bound->max_value - bound->min_value + 1;
@@ -238,14 +259,13 @@ private:
                                 : epochs_.end();
       if (it != epochs_.end()) {
         EpochInfo *epoch = &it->second;
-        if (cur_loop_layout_.defined()) {
-          ReducerUpdateArgs update = ParseReducerUpdate(op);
-          epoch->updates.push_back(UpdateSite{
-              cur_loop_layout_.value(), cur_loop_vars_, update.indices,
-              update.value, cur_serial_vars_, cur_serial_extents_});
-        } else {
+        ReducerUpdateArgs update = ParseReducerUpdate(op);
+        epoch->updates.push_back(
+            UpdateSite{cur_loop_layout_.value_or(Fragment()), cur_loop_vars_,
+                       update.indices, update.value, cur_serial_vars_,
+                       cur_serial_extents_});
+        if (!cur_loop_layout_.defined())
           epoch->analyzable = false;
-        }
       }
       return;
     }
@@ -283,6 +303,8 @@ private:
     return nullptr;
   }
 
+  bool target_is_pto_{false};
+  int64_t pto_lanes_{0};
   IterVar thread_var_;
   Optional<Fragment> cur_loop_layout_;
   Array<Var> cur_loop_vars_;
@@ -680,6 +702,43 @@ public:
       if (!epoch.buffer.defined()) {
         continue;
       }
+      if (epoch.pto_simd) {
+        ICHECK_EQ(epoch.updates.size(), 1)
+            << "PTO reducer requires exactly one static update; got "
+            << epoch.updates.size();
+        ICHECK(epoch.analyzable)
+            << "PTO reducer update is missing a solved loop layout";
+        auto layout = known_layouts.Get(epoch.buffer);
+        ICHECK(layout.has_value()) << "PTO reducer missing PartialFragment";
+        auto partial = layout.value().as<PartialFragment>();
+        ICHECK(partial.has_value()) << "PTO reducer requires PartialFragment";
+        ICHECK(epoch.buffer->shape.size() == 1 &&
+               is_one(epoch.buffer->shape[0]))
+            << "PTO reducer requires shape (1,)";
+        ICHECK(epoch.buffer->dtype == DataType::Float(16) ||
+               epoch.buffer->dtype == DataType::Float(32))
+            << "PTO reducer requires float16/float32";
+        ICHECK(epoch.op == ReducerV2OpType::kSum ||
+               epoch.op == ReducerV2OpType::kMax ||
+               epoch.op == ReducerV2OpType::kMin)
+            << "PTO reducer requires sum/max/min";
+        auto steps = partial.value()->CombineSteps();
+        ICHECK(steps.size() == 1 && steps[0].first == epoch.thread_extent &&
+               steps[0].second == 1)
+            << "PTO reducer requires one full-VL reduction plan";
+        PtoReducerPlan plan;
+        plan.old_buffer = epoch.buffer;
+        plan.accumulator = decl_buffer(epoch.buffer->shape, epoch.buffer->dtype,
+                                       epoch.buffer->name + "_acc", "local");
+        if (epoch.seed.defined())
+          plan.seed_buffer =
+              decl_buffer(epoch.buffer->shape, epoch.buffer->dtype,
+                          epoch.buffer->name + "_seed", "local");
+        plan.op = epoch.op;
+        plan.steps = steps;
+        rewriter.pto_plans_.emplace(var, std::move(plan));
+        continue;
+      }
       // The decision is read directly off the solved PartialFragment — the
       // node IS the plan (its algebra is the storage, CombineSize/
       // CombineSteps the communication). The FullParticipant object
@@ -822,6 +881,14 @@ private:
   explicit ReducerPlanAndMaterializeRewriter(arith::Analyzer *analyzer)
       : IRMutatorWithAnalyzer(analyzer) {}
 
+  struct PtoReducerPlan {
+    Buffer old_buffer;
+    Buffer accumulator;
+    Buffer seed_buffer;
+    ReducerV2OpType op;
+    std::vector<std::pair<int, int>> steps;
+  };
+
   struct Plan {
     Buffer old_buffer;
     Buffer new_buffer;
@@ -876,6 +943,7 @@ private:
     // for LowerTileOp's buffer remap.
     bool changed = false;
     Array<Buffer> new_allocs;
+    Array<Var> reducer_states;
     Map<Buffer, Layout> layout_map;
     if (auto layout_anno = p_result->annotations.Get(tl::attr::kLayoutMap)) {
       auto as_map = layout_anno.value().as<Map<Buffer, Layout>>();
@@ -883,6 +951,16 @@ private:
       layout_map = as_map.value();
     }
     for (const auto &buffer : p_result->alloc_buffers) {
+      auto pto_it = pto_plans_.find(buffer->data.get());
+      if (pto_it != pto_plans_.end()) {
+        const auto &plan = pto_it->second;
+        new_allocs.push_back(plan.accumulator);
+        if (plan.seed_buffer.defined())
+          new_allocs.push_back(plan.seed_buffer);
+        reducer_states.push_back(plan.accumulator->data);
+        changed = true;
+        continue;
+      }
       auto it = plans_.find(buffer->data.get());
       if (it != plans_.end()) {
         new_allocs.push_back(it->second.new_buffer);
@@ -934,6 +1012,11 @@ private:
       p_result->alloc_buffers = new_allocs;
       p_result->annotations.Set(tl::attr::kLayoutMap, layout_map);
     }
+    if (!reducer_states.empty()) {
+      ICHECK_EQ(op->name_hint, "SIMD_VF")
+          << "PTO reducer allocation must belong to SIMD_VF";
+      p_result->annotations.Set("tl.pto.reducer_states", reducer_states);
+    }
     if (p_result->annotations.count(attr::kReducerInfoV2)) {
       p_result->annotations.erase(attr::kReducerInfoV2);
     }
@@ -948,12 +1031,51 @@ private:
       return IRMutatorWithAnalyzer::VisitStmt_(op);
     }
     if (call->op.same_as(ReducerInitOp::Get())) {
+      auto it = pto_plans_.find(RegionArgBuffer(call->args[0])->data.get());
+      if (it != pto_plans_.end()) {
+        const auto &plan = it->second;
+        Array<Stmt> stmts;
+        if (plan.seed_buffer.defined())
+          stmts.push_back(BufferStore(plan.seed_buffer,
+                                      VisitExpr(call->args[1]), {Integer(0)}));
+        stmts.push_back(BufferStore(
+            plan.accumulator,
+            ReducerV2Identity(plan.op, plan.accumulator->dtype), {Integer(0)}));
+        return SeqStmt::Flatten(stmts);
+      }
       return MaterializeInit(call);
     }
     if (call->op.same_as(reducer_update())) {
+      auto update = ParseReducerUpdate(call);
+      auto it = pto_plans_.find(update.reducer->data.get());
+      if (it != pto_plans_.end()) {
+        const auto &plan = it->second;
+        return BufferStore(
+            plan.accumulator,
+            ReducerV2Combine(plan.op,
+                             BufferLoad(plan.accumulator, update.indices),
+                             VisitExpr(update.value)),
+            update.indices);
+      }
       return MaterializeUpdate(call);
     }
     if (call->op.same_as(FinalizeReducerV2Op::Get())) {
+      auto it = pto_plans_.find(RegionArgBuffer(call->args[0])->data.get());
+      if (it != pto_plans_.end()) {
+        const auto &plan = it->second;
+        Array<PrimExpr> args{MakeFullRegion(plan.accumulator, 1), call->args[1],
+                             Integer(static_cast<int>(plan.op))};
+        if (plan.seed_buffer.defined())
+          args.push_back(MakeFullRegion(plan.seed_buffer, 1));
+        Array<Integer> steps;
+        for (const auto &[width, scale] : plan.steps) {
+          steps.push_back(Integer(width));
+          steps.push_back(Integer(scale));
+        }
+        return Evaluate(Call(DataType::Handle(),
+                             Op::Get("tl.tileop.pto_finalize_reducer"), args,
+                             {{"plan_steps", steps}}));
+      }
       return MaterializeFinalize(call);
     }
     return IRMutatorWithAnalyzer::VisitStmt_(op);
@@ -1270,6 +1392,7 @@ private:
 
   IterVar thread_var_;
   std::unordered_map<const VarNode *, Map<String, Any>> reducer_info_;
+  std::unordered_map<const VarNode *, PtoReducerPlan> pto_plans_;
   std::unordered_map<const VarNode *, Plan> plans_;
   std::unordered_map<const VarNode *, NarrowDecision> narrow_decisions_;
   Map<Buffer, Layout> known_layouts_;

@@ -11,6 +11,7 @@
 #include <tvm/tirx/stmt_functor.h>
 
 #include "../../layout/utils.h"
+#include "../../op/utils.h"
 
 #include <functional>
 #include <sstream>
@@ -23,6 +24,354 @@ using namespace tirx;
 using ffi::Array;
 using ffi::GetRef;
 using ffi::Map;
+
+int64_t AnalyzePtoFinalize(const PtoFinalizeReducerOp &op,
+                           const PtoReducerStates &states) {
+  auto acc = op->accumulator->buffer;
+  ICHECK(states.accumulators.count(acc->data))
+      << "PTO finalize accumulator missing from tl.pto.reducer_states";
+  ICHECK(states.lanes == 64 || states.lanes == 128 || states.lanes == 256)
+      << "PTO reducer requires VL 64/128/256";
+  ICHECK(op->plan_steps.size() == 2 &&
+         op->plan_steps[0]->value == states.lanes &&
+         op->plan_steps[1]->value == 1)
+      << "PTO reducer supports only plan_steps=[VL,1]";
+  ICHECK(acc->dtype == DataType::Float(16) || acc->dtype == DataType::Float(32))
+      << "PTO reducer requires float16/float32";
+  auto check = [&](const BufferRegion &region) {
+    auto b = region->buffer;
+    ICHECK(b.scope() == "local")
+        << "PTO reducer requires ordinary local storage";
+    ICHECK(b->shape.size() == 1 && is_one(b->shape[0]) &&
+           region->region.size() == 1 && is_zero(region->region[0]->min) &&
+           is_one(region->region[0]->extent))
+        << "PTO reducer requires a single local slot region";
+    ICHECK_EQ(b->dtype, acc->dtype) << "PTO reducer dtype mismatch";
+  };
+  check(op->accumulator);
+  check(op->result);
+  ICHECK(!acc->data.same_as(op->result->buffer->data))
+      << "PTO reducer result must be independent";
+  if (op->seed.defined()) {
+    check(op->seed.value());
+    auto seed = op->seed.value()->buffer->data;
+    ICHECK(!seed.same_as(acc->data) && !seed.same_as(op->result->buffer->data))
+        << "PTO reducer seed must be independent";
+  }
+  return 1;
+}
+
+PtoReducerStates CollectReducerStates(const SBlock &vf,
+                                      const ParallelStorageQuery &storage) {
+  PtoReducerStates states;
+  if (auto lanes = vf->annotations.Get("tl.simdvf_lanes"))
+    states.lanes = Downcast<IntImm>(lanes.value())->value;
+  if (auto metadata = vf->annotations.Get(attr::kPtoReducerStates)) {
+    auto vars = metadata.value().as<Array<ffi::Any>>();
+    ICHECK(vars.has_value()) << "tl.pto.reducer_states must contain data Vars";
+    for (const auto &entry : vars.value()) {
+      auto var = entry.try_cast<Var>();
+      ICHECK(var.has_value()) << "tl.pto.reducer_states must contain data Vars";
+      Var data = var.value();
+      const auto &b = storage.Allocation(data);
+      bool owned = false;
+      for (const auto &a : vf->alloc_buffers)
+        owned |= a->data.same_as(data);
+      ICHECK(owned) << "PTO reducer metadata allocation must belong to its VF";
+      ICHECK(!states.accumulators.count(data)) << "duplicate PTO reducer state";
+      storage.CheckStorageV1(b);
+      states.accumulators.Set(data, b);
+      states.storage_values[data] = {ValueKind::kVmi, states.lanes};
+    }
+  }
+  auto check_owned = [&](const Buffer &buffer) {
+    storage.CheckStorageV1(buffer);
+    const auto &allocation = storage.Allocation(buffer->data);
+    bool owned = false;
+    for (const auto &b : vf->alloc_buffers)
+      owned |= b->data.same_as(buffer->data);
+    ICHECK(owned && allocation->dtype == buffer->dtype &&
+           ffi::StructuralEqual()(allocation->shape, buffer->shape))
+        << "PTO finalize allocation must belong to its VF and match its "
+           "storage";
+  };
+  PostOrderVisit(vf->body, [&](const ObjectRef &node) {
+    if (const auto *block = node.as<SBlockNode>())
+      ICHECK(block->name_hint != "SIMD_VF")
+          << "nested PTO reducer VF is unsupported";
+    if (const auto *eval = node.as<EvaluateNode>()) {
+      const auto *call = eval->value.as<CallNode>();
+      if (call && call->op.same_as(PtoFinalizeReducerOp::Get())) {
+        auto op =
+            Downcast<PtoFinalizeReducerOp>(ParseOperator(GetRef<Call>(call)));
+        int64_t lanes = AnalyzePtoFinalize(op, states);
+        states.storage_values[op->result->buffer->data] = {ValueKind::kVmi,
+                                                           lanes};
+        check_owned(op->accumulator->buffer);
+        check_owned(op->result->buffer);
+        if (op->seed.defined())
+          check_owned(op->seed.value()->buffer);
+        states.finalizes.push_back({GetRef<Evaluate>(eval), op});
+      }
+    }
+  });
+  return states;
+}
+
+Stmt LegalizeReducerConditional(const IfThenElseNode *branch,
+                                const PtoReducerStates &states) {
+  // One static reducer update has one destination. A missing arm reads its
+  // previous value, preserving both prior chunks and the current epoch.
+  auto get_store = [](const Stmt &body) -> const BufferStoreNode * {
+    Stmt current = body;
+    while (const auto *seq = current.as<SeqStmtNode>()) {
+      if (seq->seq.size() != 1)
+        return nullptr;
+      current = seq->seq[0];
+    }
+    return current.as<BufferStoreNode>();
+  };
+  const auto *yes = get_store(branch->then_case);
+  const auto *no = branch->else_case.defined()
+                       ? get_store(branch->else_case.value())
+                       : nullptr;
+  ICHECK(yes && states.accumulators.count(yes->buffer->data))
+      << "PTO reducer conditional requires a single accumulator update";
+  ICHECK(!branch->else_case.defined() || no)
+      << "PTO reducer conditional else must be a single accumulator store";
+  ICHECK(!no || (yes->buffer->data.same_as(no->buffer->data) &&
+                 ffi::StructuralEqual()(yes->indices, no->indices)))
+      << "PTO reducer conditional destinations must match";
+  ICHECK(!yes->predicate.defined() && (!no || !no->predicate.defined()))
+      << "PTO reducer conditional access predicates are unsupported";
+  PrimExpr previous = no ? no->value : BufferLoad(yes->buffer, yes->indices);
+  return BufferStore(yes->buffer,
+                     Select(branch->condition, yes->value, previous),
+                     yes->indices);
+}
+
+Optional<Buffer> AnalyzeReducerAccess(const PtoReducerStates &states,
+                                      const Buffer &buffer,
+                                      const Array<PrimExpr> &indices,
+                                      const ParallelStorageQuery &storage,
+                                      arith::Analyzer *analyzer,
+                                      const Map<Var, PrimExpr> &bind_env) {
+  auto found = states.accumulators.Get(buffer->data);
+  if (!found.has_value())
+    return std::nullopt;
+  storage.CheckStorageV1(buffer);
+  auto slot = storage.ResolveSlot(buffer, indices, analyzer, bind_env);
+  ICHECK_EQ(slot.slot, 0) << "PTO reducer slot must be zero";
+  return found.value();
+}
+
+// Direct UB reduce support adapted from PTO-ISA/tilelang PR #39,
+// commit dae783c88d764ea20bccd4dca4a06a25b574dc16. Keep its admission
+// and physical-layout-independent lowering separate from reducer finalize.
+bool IsPtoDirectReduce(const Call &call) {
+  return call->op.same_as(Op::Get("tl.tileop.reduce"));
+}
+
+namespace {
+int PtoVersionPrefix(const BufferRegion &region, arith::Analyzer *analyzer,
+                     const Map<Var, int> &buffer_versions) {
+  const Buffer &buffer = region->buffer;
+  auto versions = buffer_versions.Get(buffer->data);
+  if (versions.has_value() && versions.value() > 1 &&
+      buffer->shape.size() > 1 &&
+      analyzer->CanProveEqual(buffer->shape[0], versions.value()) &&
+      analyzer->CanProveEqual(region->region[0]->extent, 1)) {
+    return 1;
+  }
+  return 0;
+}
+
+Array<PrimExpr> PtoBufferStrides(const Buffer &buffer,
+                                 arith::Analyzer *analyzer) {
+  if (!buffer->strides.empty()) {
+    return buffer->strides;
+  }
+  Array<PrimExpr> result;
+  PrimExpr stride = Integer(1);
+  for (size_t i = buffer->shape.size(); i-- > 0;) {
+    result.insert(result.begin(), stride);
+    stride = analyzer->Simplify(stride * buffer->shape[i]);
+  }
+  return result;
+}
+
+} // namespace
+void CheckPtoDirectReduce(const Call &call, arith::Analyzer *analyzer,
+                          const Map<Var, int> &buffer_versions) {
+  auto fail = [&](const std::string &message) {
+    throw PtoAnalysisError("direct reduce: " + message);
+  };
+  if (call->args.size() != 5) {
+    fail("expected source, destination, operation, dim and clear");
+  }
+  const auto *kind = call->args[2].as<StringImmNode>();
+  const auto *dim = call->args[3].as<IntImmNode>();
+  const auto *clear = call->args[4].as<IntImmNode>();
+  if (!kind || !dim || !clear || (clear->value != 0 && clear->value != 1)) {
+    fail("requires constant dim, operation and boolean clear");
+  }
+  std::string operation = kind->value;
+  if (operation != "sum" && operation != "max" && operation != "min") {
+    fail("only sum, max and min are supported");
+  }
+  for (const auto &[key, value] : call->annotations) {
+    if (key == "batch" || key == "nan_propagate") {
+      const auto *integer = value.as<IntImmNode>();
+      if (!integer || integer->value != (key == "batch" ? 1 : 0)) {
+        fail("requires batch=1 and nan_propagate=False");
+      }
+    }
+  }
+  BufferRegion source = NormalizeToBufferRegion(call->args[0]);
+  BufferRegion destination = NormalizeToBufferRegion(call->args[1]);
+  Buffer src = source->buffer;
+  Buffer dst = destination->buffer;
+  auto ub = [](const Buffer &buffer) {
+    return buffer.scope() == "shared" || buffer.scope() == "shared.dyn";
+  };
+  if (!ub(src) || !ub(dst) || !src->axis_separators.empty() ||
+      !dst->axis_separators.empty()) {
+    fail("source and destination must be ordinary linear UB buffers; stage "
+         "through UB first");
+  }
+  if (src->data.same_as(dst->data)) {
+    fail("overlapping source/destination storage is not supported");
+  }
+  DataType from = src->dtype;
+  DataType to = dst->dtype;
+  bool same =
+      from == to && ((to.is_float() && (to.bits() == 16 || to.bits() == 32)) ||
+                     ((to.is_int() || to.is_uint()) && to.bits() == 32));
+  bool widen = to == DataType::Float(32) &&
+               (from == DataType::Float(16) || from.is_bfloat16());
+  if ((!same && !widen) || from.lanes() != 1 || to.lanes() != 1) {
+    fail("unsupported source/accumulator dtype combination");
+  }
+  auto logical_shape = [&](const BufferRegion &region, int *prefix) {
+    const Buffer &buffer = region->buffer;
+    if (region->region.size() != buffer->shape.size()) {
+      fail("region rank does not match its buffer");
+    }
+    *prefix = PtoVersionPrefix(region, analyzer, buffer_versions);
+    Array<PrimExpr> shape;
+    for (size_t i = *prefix; i < buffer->shape.size(); ++i) {
+      const Range &range = region->region[i];
+      if (!analyzer->CanProveEqual(range->min, 0) ||
+          !analyzer->CanProveEqual(range->extent, buffer->shape[i])) {
+        fail("requires complete logical source and destination regions");
+      }
+      shape.push_back(buffer->shape[i]);
+    }
+    return shape;
+  };
+  int source_prefix = 0;
+  int destination_prefix = 0;
+  Array<PrimExpr> src_shape = logical_shape(source, &source_prefix);
+  Array<PrimExpr> dst_shape = logical_shape(destination, &destination_prefix);
+  int rank = src_shape.size();
+  if ((rank != 1 && rank != 2) || dim->value < 0 || dim->value >= rank) {
+    fail("requires a logical 1D/2D source and a valid reduction dim");
+  }
+  auto positive = [&](const PrimExpr &expr) {
+    const auto *integer = expr.as<IntImmNode>();
+    if (!integer || integer->value <= 0) {
+      fail("all logical extents must be positive compile-time integers");
+    }
+    return integer->value;
+  };
+  for (const PrimExpr &extent : src_shape) {
+    positive(extent);
+  }
+  for (const PrimExpr &extent : dst_shape) {
+    positive(extent);
+  }
+  int reduction_axis = dim->value;
+  int output_axis = rank == 1 ? 0 : 1 - reduction_axis;
+  int64_t output_extent = rank == 1 ? 1 : positive(src_shape[output_axis]);
+  bool keep_dims = dst_shape.size() == src_shape.size();
+  if (rank == 1) {
+    if (dst_shape.size() != 1 || positive(dst_shape[0]) != 1) {
+      fail("1D reduction requires destination shape [1]");
+    }
+  } else if (keep_dims) {
+    if (positive(dst_shape[reduction_axis]) != 1 ||
+        positive(dst_shape[output_axis]) != output_extent) {
+      fail("keepdims destination shape does not match the reduction");
+    }
+  } else if (dst_shape.size() != 1 || positive(dst_shape[0]) != output_extent) {
+    fail("destination shape does not match the reduction");
+  }
+  int destination_output_axis =
+      destination_prefix + (keep_dims && rank == 2 ? output_axis : 0);
+  Array<PrimExpr> src_strides = PtoBufferStrides(src, analyzer);
+  Array<PrimExpr> dst_strides = PtoBufferStrides(dst, analyzer);
+  for (const PrimExpr &stride : src_strides) {
+    positive(stride);
+  }
+  for (const PrimExpr &stride : dst_strides) {
+    positive(stride);
+  }
+  if (rank == 2) {
+    int64_t rows = positive(src_shape[0]);
+    int64_t columns = positive(src_shape[1]);
+    int64_t row_stride = positive(src_strides[source_prefix]);
+    int64_t column_stride = positive(src_strides[source_prefix + 1]);
+    if (!((column_stride == 1 && row_stride >= columns) ||
+          (row_stride == 1 && column_stride >= rows))) {
+      fail("source strides must describe non-overlapping rows or columns");
+    }
+  }
+  bool reduce_across_lanes =
+      analyzer->CanProveEqual(src_strides[source_prefix + reduction_axis], 1);
+  if (!reduce_across_lanes &&
+      (rank != 2 ||
+       !analyzer->CanProveEqual(src_strides[source_prefix + output_axis], 1) ||
+       !analyzer->CanProveEqual(dst_strides[destination_output_axis], 1))) {
+    fail("no supported unit-stride reduction/output axis");
+  }
+}
+
+PtoDirectReducePlan PlanPtoDirectReduce(const Call &call,
+                                        arith::Analyzer *analyzer,
+                                        const Map<Var, int> &buffer_versions) {
+  PtoDirectReducePlan plan;
+  plan.source = NormalizeToBufferRegion(call->args[0]);
+  plan.destination = NormalizeToBufferRegion(call->args[1]);
+  plan.operation = Downcast<StringImm>(call->args[2])->value;
+  plan.clear = Downcast<IntImm>(call->args[4])->value != 0;
+  const Buffer &src = plan.source->buffer;
+  const Buffer &dst = plan.destination->buffer;
+  plan.accumulator_dtype = dst->dtype;
+  plan.source_prefix = PtoVersionPrefix(plan.source, analyzer, buffer_versions);
+  plan.destination_prefix =
+      PtoVersionPrefix(plan.destination, analyzer, buffer_versions);
+  plan.logical_rank = static_cast<int>(src->shape.size()) - plan.source_prefix;
+  plan.reduction_axis = Downcast<IntImm>(call->args[3])->value;
+  plan.output_axis = plan.logical_rank == 1 ? 0 : 1 - plan.reduction_axis;
+  plan.reduction_extent =
+      Downcast<IntImm>(src->shape[plan.source_prefix + plan.reduction_axis])
+          ->value;
+  plan.output_extent =
+      plan.logical_rank == 1
+          ? 1
+          : Downcast<IntImm>(src->shape[plan.source_prefix + plan.output_axis])
+                ->value;
+  bool keep_dims =
+      static_cast<int>(dst->shape.size()) - plan.destination_prefix ==
+      plan.logical_rank;
+  plan.destination_output_axis =
+      plan.destination_prefix +
+      (keep_dims && plan.logical_rank == 2 ? plan.output_axis : 0);
+  Array<PrimExpr> src_strides = PtoBufferStrides(src, analyzer);
+  plan.reduce_across_lanes = analyzer->CanProveEqual(
+      src_strides[plan.source_prefix + plan.reduction_axis], 1);
+  return plan;
+}
 
 std::string AccessPatternToString(AccessPattern pattern) {
   switch (pattern) {
@@ -616,24 +965,18 @@ public:
   void VisitExpr_(const ModNode *) final { MarkUnsupported("Mod"); }
   void VisitExpr_(const FloorDivNode *) final { MarkUnsupported("FloorDiv"); }
   void VisitExpr_(const FloorModNode *) final { MarkUnsupported("FloorMod"); }
-  void VisitExpr_(const MinNode *) final { MarkUnsupported("Min"); }
-  void VisitExpr_(const MaxNode *) final { MarkUnsupported("Max"); }
-  void VisitExpr_(const EQNode *) final { MarkUnsupported("EQ"); }
-  void VisitExpr_(const NENode *) final { MarkUnsupported("NE"); }
-  void VisitExpr_(const LTNode *) final { MarkUnsupported("LT"); }
-  void VisitExpr_(const LENode *) final { MarkUnsupported("LE"); }
-  void VisitExpr_(const GTNode *) final { MarkUnsupported("GT"); }
-  void VisitExpr_(const GENode *) final { MarkUnsupported("GE"); }
+  void VisitExpr_(const MinNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const MaxNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const EQNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const NENode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const LTNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const LENode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const GTNode *op) final { ExprVisitor::VisitExpr_(op); }
+  void VisitExpr_(const GENode *op) final { ExprVisitor::VisitExpr_(op); }
   void VisitExpr_(const AndNode *) final { MarkUnsupported("And"); }
   void VisitExpr_(const OrNode *) final { MarkUnsupported("Or"); }
   void VisitExpr_(const NotNode *) final { MarkUnsupported("Not"); }
-  void VisitExpr_(const SelectNode *) final {
-    if (!unsupported.has_value()) {
-      unsupported =
-          "Select is not vectorizable yet (integer T.abs lowers to Select; "
-          "it arrives with the PR-2 Select/cmp support)";
-    }
-  }
+  void VisitExpr_(const SelectNode *op) final { ExprVisitor::VisitExpr_(op); }
   void VisitExpr_(const RampNode *) final { MarkUnsupported("Ramp"); }
   void VisitExpr_(const BroadcastNode *) final { MarkUnsupported("Broadcast"); }
   void VisitExpr_(const ShuffleNode *) final { MarkUnsupported("Shuffle"); }
@@ -840,6 +1183,10 @@ PtoRegionScan ScanPtoRegion(const Stmt &region) {
   std::vector<const ForNode *> all;
   CollectAllParallelDeep(region, all);
   scan.has_any_parallel = !all.empty();
+  PostOrderVisit(region, [&](const ObjectRef &node) {
+    if (const auto *call = node.as<CallNode>())
+      scan.has_direct_reduce |= IsPtoDirectReduce(GetRef<Call>(call));
+  });
   if (scan.has_any_parallel && scan.units.empty()) {
     // A Parallel exists but only under an unsupported wrapper.
     scan.has_unsupported_wrapper = true;
@@ -886,6 +1233,11 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     return LaneUse::kUnknown;
   }
   if (const auto *var = expr.as<VarNode>()) {
+    if (ctx->value_infos) {
+      auto it = ctx->value_infos->find(GetRef<Var>(var));
+      if (it != ctx->value_infos->end() && it->second.kind == ValueKind::kVmi)
+        return LaneUse::kVarying;
+    }
     if (var == ctx->loop_var.get()) {
       return LaneUse::kVarying;
     }
@@ -960,6 +1312,12 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
     return LaneUse::kUnknown;
   }
   if (const auto *load = expr.as<BufferLoadNode>()) {
+    if (ctx->storage_values) {
+      auto it = ctx->storage_values->find(load->buffer->data);
+      if (it != ctx->storage_values->end() &&
+          it->second.kind == ValueKind::kVmi)
+        return LaneUse::kVarying;
+    }
     if (ctx->storage) {
       auto kind = ctx->storage->Classify(load->buffer, ctx->unit);
       if (kind == pto::StorageClass::kPrivate ||
@@ -1033,35 +1391,35 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
   } else if (const auto *minn = expr.as<MinNode>()) {
     a = &minn->a;
     b = &minn->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *maxx = expr.as<MaxNode>()) {
     a = &maxx->a;
     b = &maxx->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *lt = expr.as<LTNode>()) {
     a = &lt->a;
     b = &lt->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *len = expr.as<LENode>()) {
     a = &len->a;
     b = &len->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *gt = expr.as<GTNode>()) {
     a = &gt->a;
     b = &gt->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *ge = expr.as<GENode>()) {
     a = &ge->a;
     b = &ge->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *eq = expr.as<EQNode>()) {
     a = &eq->a;
     b = &eq->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *ne = expr.as<NENode>()) {
     a = &ne->a;
     b = &ne->b;
-    known_op = metadata_mode;
+    known_op = true;
   } else if (const auto *andn = expr.as<AndNode>()) {
     a = &andn->a;
     b = &andn->b;
@@ -1093,6 +1451,18 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
       return AnalyzeLaneUseImpl(notn->a, ctx, reason, metadata_mode);
     }
   }
+  if (const auto *sel = expr.as<SelectNode>()) {
+    auto cond = AnalyzeLaneUseImpl(sel->condition, ctx, reason, metadata_mode);
+    auto yes = AnalyzeLaneUseImpl(sel->true_value, ctx, reason, metadata_mode);
+    auto no = AnalyzeLaneUseImpl(sel->false_value, ctx, reason, metadata_mode);
+    if (cond == LaneUse::kUnknown || yes == LaneUse::kUnknown ||
+        no == LaneUse::kUnknown)
+      return LaneUse::kUnknown;
+    return cond == LaneUse::kVarying || yes == LaneUse::kVarying ||
+                   no == LaneUse::kVarying
+               ? LaneUse::kVarying
+               : LaneUse::kUniform;
+  }
   if (const auto *cast = expr.as<CastNode>()) {
     return AnalyzeLaneUseImpl(cast->value, ctx, reason, metadata_mode);
   }
@@ -1106,6 +1476,80 @@ LaneUse AnalyzeLaneUseImpl(const PrimExpr &expr, LaneUseContext *ctx,
 }
 
 } // namespace
+
+ValueInfo AnalyzeComputeValue(const PrimExpr &expr, LaneUseContext *ctx) {
+  if (const auto *var = expr.as<VarNode>()) {
+    if (ctx->value_infos) {
+      auto it = ctx->value_infos->find(GetRef<Var>(var));
+      if (it != ctx->value_infos->end())
+        return it->second;
+    }
+  }
+  if (const auto *load = expr.as<BufferLoadNode>()) {
+    if (ctx->storage_values) {
+      auto it = ctx->storage_values->find(load->buffer->data);
+      if (it != ctx->storage_values->end())
+        return it->second;
+    }
+  }
+  if (const auto *cast = expr.as<CastNode>())
+    return AnalyzeComputeValue(cast->value, ctx);
+  auto merge = [](ValueInfo a, ValueInfo b) {
+    return ValueInfo{a.kind == ValueKind::kVmi || b.kind == ValueKind::kVmi
+                         ? ValueKind::kVmi
+                         : ValueKind::kScalar,
+                     std::max(a.logical_lanes, b.logical_lanes)};
+  };
+  if (const auto *op = expr.as<AddNode>())
+    return merge(AnalyzeComputeValue(op->a, ctx),
+                 AnalyzeComputeValue(op->b, ctx));
+  if (const auto *op = expr.as<SubNode>())
+    return merge(AnalyzeComputeValue(op->a, ctx),
+                 AnalyzeComputeValue(op->b, ctx));
+  if (const auto *op = expr.as<MulNode>())
+    return merge(AnalyzeComputeValue(op->a, ctx),
+                 AnalyzeComputeValue(op->b, ctx));
+  if (const auto *op = expr.as<DivNode>())
+    return merge(AnalyzeComputeValue(op->a, ctx),
+                 AnalyzeComputeValue(op->b, ctx));
+  if (const auto *op = expr.as<MaxNode>())
+    return merge(AnalyzeComputeValue(op->a, ctx),
+                 AnalyzeComputeValue(op->b, ctx));
+  if (const auto *op = expr.as<MinNode>())
+    return merge(AnalyzeComputeValue(op->a, ctx),
+                 AnalyzeComputeValue(op->b, ctx));
+  if (const auto *op = expr.as<LTNode>())
+    return merge(AnalyzeComputeValue(op->a, ctx),
+                 AnalyzeComputeValue(op->b, ctx));
+  if (const auto *op = expr.as<LENode>())
+    return merge(AnalyzeComputeValue(op->a, ctx),
+                 AnalyzeComputeValue(op->b, ctx));
+  if (const auto *op = expr.as<GTNode>())
+    return merge(AnalyzeComputeValue(op->a, ctx),
+                 AnalyzeComputeValue(op->b, ctx));
+  if (const auto *op = expr.as<GENode>())
+    return merge(AnalyzeComputeValue(op->a, ctx),
+                 AnalyzeComputeValue(op->b, ctx));
+  if (const auto *op = expr.as<EQNode>())
+    return merge(AnalyzeComputeValue(op->a, ctx),
+                 AnalyzeComputeValue(op->b, ctx));
+  if (const auto *op = expr.as<NENode>())
+    return merge(AnalyzeComputeValue(op->a, ctx),
+                 AnalyzeComputeValue(op->b, ctx));
+  if (const auto *sel = expr.as<SelectNode>())
+    return merge(AnalyzeComputeValue(sel->condition, ctx),
+                 merge(AnalyzeComputeValue(sel->true_value, ctx),
+                       AnalyzeComputeValue(sel->false_value, ctx)));
+  if (const auto *call = expr.as<CallNode>(); call && call->args.size() == 1)
+    return AnalyzeComputeValue(call->args[0], ctx);
+  std::string reason;
+  auto use = AnalyzeLaneUse(expr, ctx, &reason);
+  ICHECK(use != LaneUse::kUnknown)
+      << "PTO value classification failed: " << reason;
+  return use == LaneUse::kVarying
+             ? ValueInfo{ValueKind::kVmi, ctx->mapping.lanes}
+             : ValueInfo{};
+}
 
 LaneUse AnalyzeLaneUse(const PrimExpr &expr, LaneUseContext *ctx,
                        std::string *reason) {
@@ -1177,6 +1621,8 @@ bool IsSupportedVectorBinaryOp(const std::string &vmi_op, DataType dtype) {
     return (is_int_like && (bits == 8 || bits == 16 || bits == 32)) ||
            is_fp_like;
   }
+  if (vmi_op == "vmax" || vmi_op == "vmin")
+    return is_fp_like;
   if (vmi_op == "vdiv") {
     return dtype.is_float() && (bits == 16 || bits == 32);
   }
